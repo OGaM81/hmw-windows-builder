@@ -123,7 +123,7 @@ namespace utils::string
 
 	void strip(const char* in, char* out, int max)
 	{
-		if (!in || !out || !max) return;
+		if (!in || !out) return;
 
 		max--;
 		auto current = 0;

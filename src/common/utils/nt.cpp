@@ -72,11 +72,6 @@ namespace utils::nt
 		std::vector<PIMAGE_SECTION_HEADER> headers;
 
 		auto nt_headers = this->get_nt_headers();
-		if (!nt_headers)
-		{
-			return headers;
-		}
-
 		auto section = IMAGE_FIRST_SECTION(nt_headers);
 
 		for (uint16_t i = 0; i < nt_headers->FileHeader.NumberOfSections; ++i, ++section)
@@ -139,6 +134,7 @@ namespace utils::nt
 
 		return { name };
 	}
+
 
 	std::filesystem::path library::get_folder() const
 	{

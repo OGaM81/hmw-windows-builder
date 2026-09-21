@@ -11,9 +11,20 @@ function get_user_language()
     user_language = game:getcurrentgamelanguage()
 end
 
+function set_language(value)
+    local file_path = "players2/default/language"
+    local file = io.open(file_path, "w")
+    file:write(value)
+    file:close()
+end
+
+function does_zone_folder_exists(language)
+    return io.directoryexists("zone/" .. language)
+end
+
 get_user_language()
 
-if user_language ~= "" and game:islanguageavailable(user_language) then
+if user_language ~= "" and does_zone_folder_exists(user_language) then
     current_language = user_language
 end
 
@@ -34,7 +45,7 @@ LUI.MenuBuilder.registerType("choose_language_menu", function(a1)
     })
 
     for i = 1, #available_languages do
-        if game:islanguageavailable(available_languages[i]) then
+        if does_zone_folder_exists(available_languages[i]) then
             menu:AddButton(Engine.Localize(string.format("MENU_%s", available_languages[i])), function()
                 LUI.yesnopopup({
                     title = Engine.Localize("@MENU_NOTICE"),
@@ -44,7 +55,7 @@ LUI.MenuBuilder.registerType("choose_language_menu", function(a1)
                         Engine.Localize("@MENU_APPLY_LANGUAGE_SETTINGS"),
                     callback = function(result)
                         if (result) then
-                            game:setlanguage(available_languages[i])
+                            set_language(available_languages[i])
                             updater.relaunch()
                         else
                             LUI.FlowManager.RequestLeaveMenu(popup)
@@ -66,7 +77,7 @@ LUI.MenuBuilder.registerType("choose_language_menu", function(a1)
     menu:AddHelp({
         name = "add_button_helper_text",
         button_ref = "",
-        helper_text = "^2" .. Engine.Localize("@LUA_MENU_DOWNLOAD") .. ": ^7https://docs.auroramod.dev/languages",
+        helper_text = "^2" .. Engine.Localize("@LUA_MENU_DOWNLOAD") .. ": ^7https://docs.h1.gg/languages",
         side = "left",
         priority = -9001,
         clickable = false
@@ -109,4 +120,4 @@ CoD.TextSettings.H1TitleFont = {
     Font = RegisterFont("fonts/bank_h1.ttf", 50),
     Height = scale(50)
 }
-]] --
+]]--

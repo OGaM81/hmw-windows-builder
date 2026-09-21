@@ -164,7 +164,7 @@ namespace scripting
 	template <>
 	bool script_value::is<float>() const
 	{
-		return this->get_raw().type == game::VAR_FLOAT || this->get_raw().type == game::VAR_INTEGER;
+		return this->get_raw().type == game::VAR_FLOAT;
 	}
 
 	template <>
@@ -176,11 +176,6 @@ namespace scripting
 	template <>
 	float script_value::get() const
 	{
-		if (this->get_raw().type == game::VAR_INTEGER)
-		{
-			return static_cast<float>(this->get_raw().u.intValue);
-		}
-
 		return this->get_raw().u.floatValue;
 	}
 

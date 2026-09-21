@@ -307,16 +307,6 @@ namespace utils::hook
 		MH_DisableHook(this->place_);
 	}
 
-	void detour::queue_enable()
-	{
-		MH_QueueEnableHook(this->place_);
-	}
-
-	void detour::queue_disable()
-	{
-		MH_QueueDisableHook(this->place_);
-	}
-
 	void detour::create(void* place, void* target)
 	{
 		this->clear();
@@ -327,7 +317,7 @@ namespace utils::hook
 			throw std::runtime_error(string::va("Unable to create hook at location: %p", this->place_));
 		}
 
-		this->queue_enable();
+		this->enable();
 	}
 
 	void detour::create(const size_t place, void* target)
@@ -550,15 +540,15 @@ namespace utils::hook
 
 		asm_function(a);
 
-		void* dst = nullptr;
-		auto result = runtime.add(&dst, &code);
+		void* result = nullptr;
+		auto err_result = runtime.add(&result, &code);
 
-		if (result != asmjit::ErrorCode::kErrorOk)
+		if (err_result != asmjit::ErrorCode::kErrorOk)
 		{
-			throw std::runtime_error(string::va("ASMJIT ERROR: %s\n", asmjit::DebugUtils::errorAsString(result)));
+			printf("ASMJIT ERROR: %s\n", asmjit::DebugUtils::errorAsString(err_result));
 		}
 
-		return dst;
+		return result;
 	}
 
 	void inject(size_t pointer, size_t data)

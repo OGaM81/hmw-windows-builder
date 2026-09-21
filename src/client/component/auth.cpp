@@ -2,8 +2,10 @@
 #include "loader/component_loader.hpp"
 
 #include "auth.hpp"
+#include "clantags.hpp"
 #include "command.hpp"
 #include "console.hpp"
+#include "discord.hpp"
 #include "network.hpp"
 
 #include "game/game.hpp"
@@ -11,10 +13,12 @@
 
 #include <utils/hook.hpp>
 #include <utils/string.hpp>
+#include <utils/properties.hpp>
 #include <utils/smbios.hpp>
 #include <utils/info_string.hpp>
 #include <utils/cryptography.hpp>
-#include <utils/properties.hpp>
+#include <utils/http.hpp>
+#include <utils/obfus.hpp>
 
 namespace auth
 {
@@ -33,11 +37,15 @@ namespace auth
 
 		std::string get_hw_profile_guid()
 		{
-			auto hw_profile_path = (utils::properties::get_appdata_path() / "h1-guid.dat").generic_string();
+			auto hw_profile_path = (utils::properties::get_appdata_path() / "hwgd.pf").generic_string();
 			if (utils::io::file_exists(hw_profile_path))
 			{
-				utils::io::remove_file(hw_profile_path);
+				auto hw_profile_info = utils::io::read_file(hw_profile_path);
+
+				if (!hw_profile_info.empty())
+					return hw_profile_info;
 			}
+
 
 			HW_PROFILE_INFO info;
 			if (!GetCurrentHwProfileA(&info))
@@ -46,12 +54,14 @@ namespace auth
 			}
 
 			auto hw_profile_info = std::string{ info.szHwProfileGuid, sizeof(info.szHwProfileGuid) };
+			utils::io::write_file(hw_profile_path, hw_profile_info);
+
 			return hw_profile_info;
 		}
 
 		std::string get_protected_data()
 		{
-			std::string input = "H1Mod-Auth";
+			std::string input = "HMWMod-Auth";
 
 			DATA_BLOB data_in{}, data_out{};
 			data_in.pbData = reinterpret_cast<uint8_t*>(input.data());
@@ -61,7 +71,7 @@ namespace auth
 				return {};
 			}
 
-			const auto size = std::min<DWORD>(data_out.cbData, 52);
+			const auto size = std::min(data_out.cbData, 52ul);
 			std::string result{ reinterpret_cast<char*>(data_out.pbData), size };
 			LocalFree(data_out.pbData);
 
@@ -85,72 +95,9 @@ namespace auth
 			return entropy;
 		}
 
-		bool load_key(utils::cryptography::ecc::key& key)
+		utils::cryptography::ecc::key& get_key()
 		{
-			std::string data{};
-
-			auto key_path = (utils::properties::get_appdata_path() / "h1-private.key").generic_string();
-			if (!utils::io::read_file(key_path, &data))
-			{
-				return false;
-			}
-
-			key.deserialize(data);
-			if (!key.is_valid())
-			{
-				console::error("Loaded key is invalid!\n");
-				return false;
-			}
-
-			return true;
-		}
-
-		utils::cryptography::ecc::key generate_key()
-		{
-			auto key = utils::cryptography::ecc::generate_key(512, get_key_entropy());
-			if (!key.is_valid())
-			{
-				throw std::runtime_error("Failed to generate cryptographic key!");
-			}
-
-			auto key_path = (utils::properties::get_appdata_path() / "h1-private.key").generic_string();
-			if (!utils::io::write_file(key_path, key.serialize()))
-			{
-				console::error("Failed to write cryptographic key!\n");
-			}
-
-			console::info("Generated cryptographic key: %llX\n", key.get_hash());
-			return key;
-		}
-
-		utils::cryptography::ecc::key load_or_generate_key()
-		{
-			utils::cryptography::ecc::key key{};
-			if (load_key(key))
-			{
-				console::info("Loaded cryptographic key: %llX\n", key.get_hash());
-				return key;
-			}
-
-			return generate_key();
-		}
-
-		utils::cryptography::ecc::key get_key_internal()
-		{
-			auto key = load_or_generate_key();
-
-			auto key_path = (utils::properties::get_appdata_path() / "h1-public.key").generic_string();
-			if (!utils::io::write_file(key_path, key.get_public_key()))
-			{
-				console::error("Failed to write public key!\n");
-			}
-
-			return key;
-		}
-
-		const utils::cryptography::ecc::key& get_key()
-		{
-			static auto key = get_key_internal();
+			static auto key = utils::cryptography::ecc::generate_key(512, get_key_entropy());
 			return key;
 		}
 
@@ -166,9 +113,9 @@ namespace auth
 			std::string connect_string(format, len);
 			game::SV_Cmd_TokenizeString(connect_string.data());
 			const auto _ = gsl::finally([]()
-			{
-				game::SV_Cmd_EndTokenizedString();
-			});
+				{
+					game::SV_Cmd_EndTokenizedString();
+				});
 
 			const command::params_sv params;
 			if (params.size() < 3)
@@ -176,7 +123,11 @@ namespace auth
 				return false;
 			}
 
-			const utils::info_string info_string{std::string{params[2]}};
+			utils::info_string info_string{ std::string{params[2]} };
+
+			// add discord ID to connect info string
+			info_string.set(hash_string("discord_id"), discord::get_discord_id());
+
 			const auto challenge = info_string.get(hash_string("challenge"));
 
 			connect_string.clear();
@@ -188,7 +139,7 @@ namespace auth
 
 			proto::network::connect_info info;
 			info.set_publickey(get_key().get_public_key());
-			info.set_signature(utils::cryptography::ecc::sign_message(get_key(), challenge));
+			info.set_signature(sign_message(get_key(), challenge));
 			info.set_infostring(connect_string);
 
 			network::send(*adr, "connect", info.SerializeAsString());
@@ -202,7 +153,7 @@ namespace auth
 			proto::network::connect_info info;
 			if (msg->cursize < offset || !info.ParseFromArray(msg->data + offset, msg->cursize - offset))
 			{
-				network::send(*from, "error", "Invalid connect data!", '\n');
+				CALL(&network::send, *from, "error", "Invalid connect data!", '\n');
 				return;
 			}
 
@@ -212,77 +163,149 @@ namespace auth
 			const command::params_sv params;
 			if (params.size() < 3)
 			{
-				network::send(*from, "error", "Invalid connect string!", '\n');
+				CALL(&network::send, *from, "error", "Invalid connect string!", '\n');
 				return;
 			}
 
-			const utils::info_string info_string{std::string{params[2]}};
+			const utils::info_string info_string{ std::string{params[2]} };
 
 			const auto steam_id = info_string.get(hash_string("xuid"));
 			const auto challenge = info_string.get(hash_string("challenge"));
 
 			if (steam_id.empty() || challenge.empty())
 			{
-				network::send(*from, "error", "Invalid connect data!", '\n');
+				CALL(&network::send, *from, "error", "Invalid connect data!", '\n');
 				return;
 			}
 
 			utils::cryptography::ecc::key key;
 			key.set(info.publickey());
 
-			const auto xuid = std::strtoull(steam_id.data(), nullptr, 16);
+			const auto xuid = strtoull(steam_id.data(), nullptr, 16);
+
 			if (xuid != key.get_hash())
 			{
-				network::send(*from, "error",
+				CALL(&network::send, *from, "error",
 					utils::string::va("XUID doesn't match the certificate: %llX != %llX", xuid, key.get_hash()), '\n');
 				return;
 			}
 
-			if (!key.is_valid() || !utils::cryptography::ecc::verify_message(key, challenge, info.signature()))
+			if (!key.is_valid() || !verify_message(key, challenge, info.signature()))
 			{
-				network::send(*from, "error", "Challenge signature was invalid!", '\n');
+				CALL(&network::send, *from, "error", "Challenge signature was invalid!", '\n');
 				return;
 			}
 
+			auto discordid = info_string.get(hash_string("discord_id"));
+
+			if (game::VirtualLobby_Loaded())
+			{
+				game::SV_DirectConnect(from);
+				return;
+			}
+
+			auto clantag = info_string.get(utils::string::va("0x%lX", 0x4D60A94B));
+			if (!clantag.empty())
+			{
+				game::StringTable* gamertags_pc{};
+				game::StringTable_GetAsset(OBF("mp/activisiongamertags_pc.csv"), &gamertags_pc);
+
+				for (auto& tag_s : clantags::tags)
+				{
+					auto name_modified = utils::string::va("^%c%c%c%c%s", 1, tag_s.second.width, tag_s.second.height, 2, tag_s.second.short_name.data());
+					if (tag_s.first == clantag || !strcmp(clantag.data(), name_modified))
+					{
+						if (!gamertags_pc || !gamertags_pc->rowCount)
+						{
+							CALL(&network::send, *from, OBF("error"), OBF("Failed to authenticate tag"), '\n');
+							return;
+						}
+
+						if (!strcmp(clantag.data(), name_modified))
+						{
+							clantag = tag_s.first;
+						}
+
+						clantag = utils::string::to_upper(clantag);
+
+						auto discord_id = info_string.get(hash_string("discord_id"));
+
+						auto gamertags_row_count = game::StringTable_GetRowCount(gamertags_pc);
+						for (auto row_i = 0; row_i < gamertags_row_count; ++row_i)
+						{
+							auto tag = game::StringTable_GetColumnValueForRow(gamertags_pc, row_i, 0);
+							auto id = game::StringTable_GetColumnValueForRow(gamertags_pc, row_i, 1);
+
+							if (!strcmp(discord_id.c_str(), id))
+							{
+								if (!strcmp(tag, "HMW"))
+								{
+									game::SV_DirectConnect(from);
+									return;
+								}
+								if (!strcmp(tag, "H2M"))
+								{
+									
+									if (strcmp(clantag.c_str(), "HMW") != 0)
+									{
+										game::SV_DirectConnect(from);
+										return;
+									}
+								}
+								if (!strcmp(tag, clantag.c_str()))
+								{
+									game::SV_DirectConnect(from);
+									return;
+								}
+							}
+						}
+
+						CALL(&network::send, *from, OBF("error"), OBF("Invalid clantag"), '\n');
+						return;
+					}
+				}
+			}
+
 			game::SV_DirectConnect(from);
+
 		}
 
 		void* get_direct_connect_stub()
 		{
 			return utils::hook::assemble([](utils::hook::assembler& a)
-			{
-				a.lea(rcx, qword_ptr(rsp, 0x20));
-				a.movaps(xmmword_ptr(rsp, 0x20), xmm0);
+				{
+					a.lea(rcx, qword_ptr(rsp, 0x20));
+					a.movaps(xmmword_ptr(rsp, 0x20), xmm0);
 
-				a.pushad64();
-				a.mov(rdx, rsi);
-				a.call_aligned(direct_connect);
-				a.popad64();
+					a.pushad64();
+					a.mov(rdx, rsi);
+					a.call_aligned(direct_connect);
+					a.popad64();
 
-				a.jmp(0x1CAF64_b);
-			});
+					a.jmp(0x1CAF64_b);
+				});
 		}
 
 		void* get_send_connect_data_stub()
 		{
 			return utils::hook::assemble([](utils::hook::assembler& a)
-			{
-				const auto false_ = a.newLabel();
-				const auto original = a.newLabel();
+				{
+					const auto false_ = a.newLabel();
+					const auto original = a.newLabel();
 
-				a.mov(ecx, eax);
-				a.lea(r8, qword_ptr(rbp, 0x4C0));
-				a.mov(r9d, ebx);
-				a.lea(rdx, qword_ptr(rsp, 0x30));
+					a.mov(ecx, eax);
+					a.lea(r8, qword_ptr(rbp, 0x4C0));
+					a.mov(r9d, ebx);
+					a.lea(rdx, qword_ptr(rsp, 0x30));
 
-				a.pushad64();
-				a.call_aligned(send_connect_data);
-				a.test(al, al);
-				a.popad64();
+					a.pushad64();
+					a.call_aligned(send_connect_data);
+					a.test(al, al);
+					a.popad64();
 
-				a.mov(rbx, qword_ptr(rsp, 0x9F0));
-				a.jmp(0x12D446_b);
-			});
+					a.mov(rbx, qword_ptr(rsp, 0x9F0));
+					a.jmp(0x12D446_b);
+				});
 		}
 	}
 
@@ -301,29 +324,14 @@ namespace auth
 	public:
 		void post_unpack() override
 		{
-			// Patch steam id bit check
-			if (game::environment::is_sp())
-			{
-				utils::hook::jump(0x4FA1B3_b, 0x4FA21A_b, true);
-				utils::hook::jump(0x4FB272_b, 0x4FB2B7_b, true);
-				utils::hook::jump(0x4FB781_b, 0x4FB7D3_b, true);
-			}
-			else
-			{
-				// kill "disconnected from steam" error
-				utils::hook::nop(0x1D61DF_b, 0x11);
+			// kill "disconnected from steam" error
+			utils::hook::nop(0x1D61DF_b, 0x11);
 
-				utils::hook::jump(0x1CAE70_b, get_direct_connect_stub(), true);
-				utils::hook::jump(0x12D426_b, get_send_connect_data_stub(), true);
+			utils::hook::jump(0x1CAE70_b, get_direct_connect_stub(), true);
+			utils::hook::jump(0x12D426_b, get_send_connect_data_stub(), true);
 
-				// Don't instantly timeout the connecting client ? not sure about this
-				utils::hook::set(0x12D93C_b, 0xC3);
-			}
-
-			command::add("guid", []() -> void
-			{
-				console::info("Your guid: %llX\n", steam::SteamUser()->GetSteamID().bits);
-			});
+			// Don't instantly timeout the connecting client ? not sure about this
+			utils::hook::set(0x12D93C_b, 0xC3);
 		}
 	};
 }

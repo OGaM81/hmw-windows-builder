@@ -350,13 +350,14 @@ namespace console
 		component()
 		{
 			ShowWindow(GetConsoleWindow(), SW_HIDE);
-			printf_hook.create(printf, printf_stub);
 		}
 
 		void post_unpack() override
 		{
+			printf_hook.create(printf, printf_stub);
+
 			ShowWindow(GetConsoleWindow(), SW_SHOW);
-			SetConsoleTitle("H1-Mod: " VERSION);
+			SetConsoleTitle("HorizonMW: " VERSION);
 
 			con.kill_event = CreateEvent(NULL, TRUE, FALSE, NULL);
 

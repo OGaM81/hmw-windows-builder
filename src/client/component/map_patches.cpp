@@ -1,4 +1,4 @@
-﻿#include <std_include.hpp>
+#include <std_include.hpp>
 #include "loader/component_loader.hpp"
 
 #include "game/game.hpp"
@@ -8,6 +8,49 @@
 
 namespace map_patches
 {
+	struct GfxLightGridTree
+	{
+		unsigned char index;
+		unsigned char maxDepth;
+		char unused[2];
+		int nodeCount;
+		int leafCount;
+		int coordMinGridSpace[3];
+		int coordMaxGridSpace[3];
+		int coordHalfSizeGridSpace[3];
+		int defaultColorIndexBitCount;
+		int defaultLightIndexBitCount;
+		unsigned int* p_nodeTable;
+		int leafTableSize;
+		unsigned char* p_leafTable;
+	};
+
+	enum leaf_table_version : std::int8_t
+	{
+		h2 = 0i8,
+		h1 = 0i8,
+		s1 = 0i8,
+		iw6 = 1i8,
+	};
+
+	utils::hook::detour r_decode_light_grid_block_hook;
+	void r_decode_light_grid_block_stub(GfxLightGridTree* p_tree, int child_mask,
+		char child_index, int encoded_node_address, char* p_node_raw, char* p_leaf_raw)
+	{
+		static const auto p_address = 0x6A032E_b + 1;
+		if (p_tree->unused[0] == leaf_table_version::iw6 && *(uint8_t*)p_address != 6)
+		{
+			utils::hook::set<uint8_t>(p_address, 6); // iw6
+		}
+		else if (*(uint8_t*)p_address != 7)
+		{
+			utils::hook::set<uint8_t>(p_address, 7); // s1,h1,h2
+		}
+
+		r_decode_light_grid_block_hook.invoke<void>(p_tree, child_mask,
+			child_index, encoded_node_address, p_node_raw, p_leaf_raw);
+	}
+
 	namespace
 	{
 		struct GfxLightGridRow
@@ -26,128 +69,12 @@ namespace map_patches
 			unsigned char voxel;
 		};
 
-		struct GfxHeroLightParams
-		{
-			const float* heroLightSamplePos;
-			const float(*viewModelAmbient)[3];
-			const float(*heroAmbient)[3];
-		};
-
-		struct GfxLight
-		{
-			unsigned __int8 type;
-			unsigned __int8 physicallyBased;
-			unsigned __int8 canUseShadowMap;
-			unsigned __int8 shadowState;
-			char opl;
-			char lightingState;
-			char __pad[2];
-			float color[3];
-			float dir[3];
-			float up[3];
-			float origin[3];
-			float radius;
-			float fadeOffset[2];
-			float bulbRadius;
-			float bulbLength[3];
-			float cosHalfFovOuter;
-			float cosHalfFovInner;
-			int exponent;
-			unsigned int spotShadowIndex;
-			float dynamicSpotLightNearPlaneOffset;
-			float dynamicSpotLightLength;
-			float cucRotationOffsetRad;
-			float cucRotationSpeedRad;
-			float cucScrollVector[2];
-			float cucScaleVector[2];
-			float cucTransVector[2];
-			game::GfxLightDef* def;
-		};
-
-		struct GfxPrimaryLightsAndWeights
-		{
-			unsigned int primaryLightCount;
-			const GfxLight* primaryLights[8];
-			float primaryLightWeights[8];
-		};
-
-		struct GfxLightGridColors_IW5
-		{
-			unsigned char rgb[56][3];
-		};
-
 		//WEAK game::symbol<bool(const game::GfxLightGrid* lightGrid, const game::GfxLightGridEntry* entry, int cornerIndex, const unsigned int* pos, const float* samplePos)> R_IsValidLightGridSample{ 0x0, 0x6D7E40 };
-		WEAK game::symbol<void(float*)> Vec3Normalize{ 0x5E090, 0x68D20 };
-		WEAK game::symbol<int(int, float const* const, float const* const, struct game::Bounds const*, unsigned int, int)> SV_BrushModelSightTrace{ 0x19F830, 0x3370A0 };
+		WEAK game::symbol<void(float*)> Vec3Normalize{ 0x68D20 };
+		WEAK game::symbol<int(int, float const* const, float const* const, struct game::Bounds const*, unsigned int, int)> SV_BrushModelSightTrace{ 0x3370A0 };
 
-		game::symbol<game::ComWorld*> comWorld{ 0xECA078, 0x10B4528 };
-		game::symbol<game::GfxWorld*> s_world{ 0xF7A2BE0, 0xE973AE0 };
-
-		game::dvar_t* r_lightGridNonCompressed;
-
-		namespace
-		{
-			typedef unsigned short ushort;
-			typedef unsigned int uint;
-
-			uint as_uint(const float x) {
-				return *(uint*)&x;
-			}
-			float as_float(const uint x) {
-				return *(float*)&x;
-			}
-
-			float half_to_float(const ushort x) { // IEEE-754 16-bit floating-point format (without infinity): 1-5-10, exp-15, +-131008.0, +-6.1035156E-5, +-5.9604645E-8, 3.311 digits
-				const uint e = (x & 0x7C00) >> 10; // exponent
-				const uint m = (x & 0x03FF) << 13; // mantissa
-				const uint v = as_uint((float)m) >> 23; // evil log2 bit hack to count leading zeros in denormalized format
-				return as_float((x & 0x8000) << 16 | (e != 0) * ((e + 112) << 23 | m) | ((e == 0) & (m != 0)) * ((v - 37) << 23 | ((m << (150 - v)) & 0x007FE000))); // sign : normalized : denormalized
-			}
-			ushort float_to_half(const float x) { // IEEE-754 16-bit floating-point format (without infinity): 1-5-10, exp-15, +-131008.0, +-6.1035156E-5, +-5.9604645E-8, 3.311 digits
-				const uint b = as_uint(x) + 0x00001000; // round-to-nearest-even: add last bit after truncated mantissa
-				const uint e = (b & 0x7F800000) >> 23; // exponent
-				const uint m = b & 0x007FFFFF; // mantissa; in line below: 0x007FF000 = 0x00800000-0x00001000 = decimal indicator flag - initial rounding
-				return (ushort)((b & 0x80000000) >> 16 | (e > 112) * ((((e - 112) << 10) & 0x7C00) | m >> 13) | ((e < 113) & (e > 101)) * ((((0x007FF000 + m) >> (125 - e)) + 1) >> 1) | (e > 143) * 0x7FFF); // sign : normalized : denormalized : saturate
-			}
-		}
-
-		void GetColors(game::GfxLightGridColors* from, GfxLightGridColors_IW5* to)
-		{
-			for (auto i = 0; i < 56; i++)
-			{
-				for (auto j = 0; j < 3; j++)
-				{
-					to->rgb[i][j] = static_cast<unsigned char>(half_to_float(from->rgb[i][j]) * 255.0f);
-				}
-			}
-		}
-
-		void GetColors(GfxLightGridColors_IW5* from, game::GfxLightGridColors* to)
-		{
-			for (auto i = 0; i < 56; i++)
-			{
-				for (auto j = 0; j < 3; j++)
-				{
-					to->rgb[i][j] = static_cast<unsigned short>(float_to_half(from->rgb[i][j] / 255.0f));
-				}
-			}
-		}
-
-		void blend_colors(game::GfxLightGridColors* colorsa, game::GfxLightGridColors* colorsb, float blendFactor = 0.5f)
-		{
-			for (auto i = 0; i < 56; i++)
-			{
-				for (auto channel = 0; channel < 3; channel++)
-				{
-					auto a = half_to_float(colorsa->rgb[i][channel]) * 255.0f;
-					auto b = half_to_float(colorsb->rgb[i][channel]) * 255.0f;
-
-					auto val = a * (1.0f - blendFactor) + b * blendFactor;
-
-					colorsa->rgb[i][channel] = float_to_half(val / 255.0f);
-				}
-			}
-		}
+		game::symbol<game::ComWorld> comWorld{ 0xA97C0E0 };
+		game::symbol<game::GfxWorld*> s_world{ 0xE973AE0 };
 
 		bool R_IsBetterPrimaryLightEnv(unsigned short oldPrimaryLightEnvIndex, unsigned short newPrimaryLightEnvIndex, float oldWeight, float newWeight)
 		{
@@ -155,16 +82,14 @@ namespace map_patches
 				return true;
 			if (!newPrimaryLightEnvIndex)
 				return false;
-
-			auto comWorld_ptr = *comWorld;
-			if (comWorld_ptr->primaryLightEnvs[oldPrimaryLightEnvIndex].numIndices == 1
-				&& comWorld_ptr->primaryLightEnvs[oldPrimaryLightEnvIndex].primaryLightIndices[0] >= 2048
+			if (comWorld->primaryLightEnvs[oldPrimaryLightEnvIndex].numIndices == 1
+				&& comWorld->primaryLightEnvs[oldPrimaryLightEnvIndex].primaryLightIndices[0] >= 2048
 				- (*s_world)->lastSunPrimaryLightIndex)
 			{
 				return true;
 			}
-			if (comWorld_ptr->primaryLightEnvs[newPrimaryLightEnvIndex].numIndices == 1
-				&& comWorld_ptr->primaryLightEnvs[newPrimaryLightEnvIndex].primaryLightIndices[0] >= 2048
+			if (comWorld->primaryLightEnvs[newPrimaryLightEnvIndex].numIndices == 1
+				&& comWorld->primaryLightEnvs[newPrimaryLightEnvIndex].primaryLightIndices[0] >= 2048
 				- (*s_world)->lastSunPrimaryLightIndex)
 			{
 				return false;
@@ -176,194 +101,202 @@ namespace map_patches
 			const game::GfxLightGrid* lightGrid,
 			const unsigned int* pos,
 			const game::GfxLightGridEntry** entries,
-			unsigned short* defaultGridEntry)
+			unsigned int* defaultGridEntry)
 		{
-			__int64 v4; // rax
-			int v7; // er10
-			__int64 v8; // rcx
-			unsigned short v10; // cx
-			const game::GfxLightGridEntry* v11; // r8
-			unsigned __int8* v12; // rdi
-			unsigned int v13; // esi
-			unsigned int v14; // er10
-			unsigned int v15; // er15
-			int v16; // ebp
-			unsigned __int8* v17; // r9
-			unsigned int v18; // esi
-			unsigned int v19; // eax
-			__int64 v20; // rdi
-			const game::GfxLightGridEntry* v21; // rax
-			const game::GfxLightGridEntry* v22; // rax
-			unsigned int v23; // er12
-			int v24; // ecx
-			__int64 v25; // rax
-			unsigned __int8 v26; // dl
-			int v27; // ecx
-			unsigned int v28; // er14
-			unsigned int v29; // ecx
-			unsigned int v30; // er15
-			__int64 v31; // rdx
-			const game::GfxLightGridEntry* v32; // rax
-			const game::GfxLightGridEntry* v33; // rax
-			unsigned int v34; // eax
-			__int64 v35; // rdx
-			bool v36; // cf
-			int v37; // ebp
-			unsigned __int8* v38; // r9
-			int v39; // ecx
-			unsigned int v40; // er10
-			const game::GfxLightGridEntry* v41; // rax
+			const game::GfxLightGridEntry* v4;
+			const game::GfxLightGridEntry* v5;
+			int v6;
+			const game::GfxLightGridEntry* v7;
+			const game::GfxLightGridEntry* v8;
+			const game::GfxLightGridEntry* v9;
+			const game::GfxLightGridEntry* v10;
+			int v11;
+			const game::GfxLightGridEntry* v12;
+			const game::GfxLightGridEntry* v13;
+			unsigned __int16 v14;
+			unsigned int lookup;
+			unsigned int lookupa;
+			unsigned int lookupb;
+			unsigned int lookupc;
+			unsigned int firstBlockEntry;
+			unsigned int firstBlockEntrya;
+			unsigned int z;
+			unsigned int localZ;
+			const unsigned __int8* rleData;
+			const unsigned __int8* rleDataa;
+			const GfxLightGridRow* remoteRow;
+			unsigned int rleSizeFull;
+			unsigned int colIndex;
+			const unsigned __int8* remote_rleData;
+			unsigned int rowIndex;
+			unsigned int baseZ;
+			unsigned int baseZa;
+			unsigned int baseZb;
+			unsigned int baseZc;
 
-			v4 = lightGrid->rowAxis;
-			v7 = lightGrid->mins[v4];
-			v8 = pos[v4] - v7;
-			if ((unsigned int)v8 >= (unsigned int)lightGrid->maxs[v4] - v7 + 1
-				|| (v10 = lightGrid->rowDataStart[v8], v10 == 0xFFFF))
+			rowIndex = pos[lightGrid->rowAxis] - lightGrid->mins[lightGrid->rowAxis];
+			if (rowIndex >= lightGrid->maxs[lightGrid->rowAxis] + 1 - (unsigned int)lightGrid->mins[lightGrid->rowAxis])
+				v14 = 0xFFFF;
+			else
+				v14 = lightGrid->rowDataStart[rowIndex];
+			if (v14 == 0xFFFF)
 			{
-				*entries = 0i64;
-				entries[1] = 0i64;
-				entries[2] = 0i64;
-				entries[3] = 0i64;
+				*entries = 0;
+				entries[1] = 0;
+				entries[2] = 0;
+				entries[3] = 0;
 				return;
 			}
-			v11 = 0i64;
-			v12 = &lightGrid->rawRowData[4 * v10];
-			v13 = pos[lightGrid->colAxis] - *(unsigned short*)v12;
-			v14 = pos[2] - *((unsigned short*)v12 + 2);
-			if (v13 + 1 > *((unsigned short*)v12 + 1))
+			if (4 * (unsigned int)v14 >= lightGrid->rawRowDataSize)
 			{
-				*entries = 0i64;
-				entries[1] = 0i64;
-				entries[2] = 0i64;
-				entries[3] = 0i64;
+				__debugbreak();
+			}
+			remoteRow = (const GfxLightGridRow*)&lightGrid->rawRowData[4 * v14];
+			if (remoteRow->firstEntry >= lightGrid->entryCount)
+			{
+				__debugbreak();
+			}
+			colIndex = pos[lightGrid->colAxis] - remoteRow->colStart;
+			z = pos[2] - remoteRow->zStart;
+			if (colIndex + 1 > remoteRow->colCount)
+			{
+				*entries = 0;
+				entries[1] = 0;
+				entries[2] = 0;
+				entries[3] = 0;
 				return;
 			}
-			v15 = *((unsigned short*)v12 + 3);
-			if (v14 + 1 > v15)
+			if (z + 1 > remoteRow->zCount)
 			{
-				*entries = 0i64;
-				entries[1] = 0i64;
-				entries[2] = 0i64;
-				entries[3] = 0i64;
-				if (pos[2] < *((unsigned short*)v12 + 2) && !lightGrid->useSkyForLowZ)
+				*entries = 0;
+				entries[1] = 0;
+				entries[2] = 0;
+				entries[3] = 0;
+				if (pos[2] < remoteRow->zStart)
 					*defaultGridEntry = 0;
 				return;
 			}
-			v16 = *((int*)v12 + 2);
-			v17 = v12 + 12;
-			if (v13 != -1)
+			firstBlockEntry = remoteRow->firstEntry;
+			remote_rleData = (const unsigned __int8*)&remoteRow[1];
+			rleSizeFull = (remoteRow->zCount > 0xFFu) + 3;
+			rleData = (const unsigned __int8*)&remoteRow[1];
+			if (colIndex == -1)
 			{
-				v23 = ((unsigned short)v15 > 0xFFu) + 3;
-				if (v13 >= *v17)
+				*entries = 0;
+				entries[1] = 0;
+				baseZ = LOBYTE(remoteRow[1].colCount);
+				if (remoteRow->zCount > 0xFFu)
+					baseZ += HIBYTE(remoteRow[1].colCount) << 8;
+				lookup = z - baseZ + firstBlockEntry;
+				if (z - baseZ < HIBYTE(remoteRow[1].colStart))
+					v13 = &lightGrid->entries[lookup];
+				else
+					v13 = 0;
+				entries[2] = v13;
+				if (z - baseZ + 1 < HIBYTE(remoteRow[1].colStart))
+					v12 = &lightGrid->entries[lookup + 1];
+				else
+					v12 = 0;
+				entries[3] = v12;
+				if (z < baseZ)
+					*defaultGridEntry = 0;
+			}
+			else
+			{
+				while (colIndex >= *rleData)
 				{
-					do
-					{
-						v24 = *v17;
-						v13 -= v24;
-						v16 += v24 * v17[1];
-						v25 = v23;
-						if (!v17[1])
-							v25 = 2i64;
-						v17 += v25;
-					} while (v13 >= *v17);
-					v15 = *((short*)v12 + 3);
+					colIndex -= *rleData;
+					firstBlockEntry += rleData[1] * *rleData;
+					if (rleData[1])
+						v11 = (remoteRow->zCount > 0xFFu) + 3;
+					else
+						v11 = 2;
+					remote_rleData += v11;
+					rleData = remote_rleData;
 				}
-				if (v17[1])
+				if (rleData[1])
 				{
-					v29 = v17[2];
-					if ((unsigned short)v15 > 0xFFu)
-						v29 += v17[3] << 8;
-					if (v14 < v29)
+					baseZb = rleData[2];
+					if (remoteRow->zCount > 0xFFu)
+						baseZb += rleData[3] << 8;
+					if (z < baseZb)
 						*defaultGridEntry = 0;
-					v30 = v14 - v29;
-					v31 = v16 + v14 - v29 + v13 * v17[1];
-					if (v14 - v29 < v17[1])
-						v32 = &lightGrid->entries[v31];
+					localZ = z - baseZb;
+					lookupa = z - baseZb + firstBlockEntry + colIndex * rleData[1];
+					if (z - baseZb < rleData[1])
+						v10 = &lightGrid->entries[lookupa];
 					else
-						v32 = 0i64;
-					*entries = v32;
-					if (v30 + 1 < v17[1])
-						v33 = &lightGrid->entries[(unsigned int)(v31 + 1)];
+						v10 = 0;
+					*entries = v10;
+					if (localZ + 1 < rleData[1])
+						v9 = &lightGrid->entries[lookupa + 1];
 					else
-						v33 = 0i64;
-					entries[1] = v33;
-					v28 = *v17;
-					if (v13 + 1 < v28)
+						v9 = 0;
+					entries[1] = v9;
+					if (colIndex + 1 < *rleData)
 					{
-						v34 = v17[1];
-						v35 = v34 + (unsigned int)v31;
-						if (v30 < v34)
-							entries[2] = &lightGrid->entries[v35];
+						lookupb = lookupa + rleData[1];
+						if (localZ < rleData[1])
+							v8 = &lightGrid->entries[lookupb];
 						else
-							entries[2] = 0i64;
-						v36 = v30 + 1 < v17[1];
-						goto LABEL_59;
+							v8 = 0;
+						entries[2] = v8;
+						if (localZ + 1 < rleData[1])
+							v7 = &lightGrid->entries[lookupb + 1];
+						else
+							v7 = 0;
+						entries[3] = v7;
+						return;
 					}
 				}
 				else
 				{
-					*entries = 0i64;
-					entries[1] = 0i64;
-					v26 = v17[3];
-					if (v26)
+					*entries = 0;
+					entries[1] = 0;
+					if (rleData[3])
 					{
-						v27 = v17[4];
-						if (*((unsigned short*)v12 + 3) > 0xFFu)
-							v27 += v17[5] << 8;
-						if (v14 < v27 + (unsigned int)v26)
+						baseZa = rleData[4];
+						if (remoteRow->zCount > 0xFFu)
+							baseZa += rleData[5] << 8;
+						if (z < baseZa + rleData[3])
 							*defaultGridEntry = 0;
 					}
-					v28 = *v17;
-					if (v13 + 1 < v28)
-						goto LABEL_32;
+					if (colIndex + 1 < *rleData)
+					{
+						entries[2] = 0;
+						entries[3] = 0;
+						return;
+					}
 				}
-				if (pos[lightGrid->colAxis] + 1u == (unsigned int)(*((unsigned short*)v12 + 1u) + *(unsigned short*)v12))
+				if (pos[lightGrid->colAxis] + 1u == (unsigned int)remoteRow->colCount + remoteRow->colStart)
 				{
-				LABEL_32:
-					entries[2] = 0i64;
-				LABEL_33:
-					entries[3] = v11;
-					return;
+					entries[2] = 0;
+					entries[3] = 0;
 				}
-				v37 = v28 * v17[1] + v16;
-				if (!v17[1])
-					v23 = 2;
-				v38 = &v17[v23];
-				v39 = v38[2];
-				if (*((unsigned short*)v12 + 3) > 0xFFu)
-					v39 += v38[3] << 8;
-				v40 = v14 - v39;
-				v35 = v40 + v37;
-				if (v40 < v38[1])
-					v41 = &lightGrid->entries[v35];
 				else
-					v41 = 0i64;
-				entries[2] = v41;
-				v36 = v40 + 1 < v38[1];
-			LABEL_59:
-				if (v36)
-					v11 = &lightGrid->entries[(unsigned int)(v35 + 1)];
-				goto LABEL_33;
+				{
+					firstBlockEntrya = firstBlockEntry + rleData[1] * *rleData;
+					if (rleData[1])
+						v6 = rleSizeFull;
+					else
+						v6 = 2;
+					rleDataa = &rleData[v6];
+					baseZc = rleDataa[2];
+					if (remoteRow->zCount > 0xFFu)
+						baseZc += rleDataa[3] << 8;
+					lookupc = z - baseZc + firstBlockEntrya;
+					if (z - baseZc < rleDataa[1])
+						v5 = &lightGrid->entries[lookupc];
+					else
+						v5 = 0;
+					entries[2] = v5;
+					if (z - baseZc + 1 < rleDataa[1])
+						v4 = &lightGrid->entries[lookupc + 1];
+					else
+						v4 = 0;
+					entries[3] = v4;
+				}
 			}
-			*entries = 0i64;
-			entries[1] = 0i64;
-			v18 = v12[14];
-			if (*((unsigned short*)v12 + 3) > 0xFFu)
-				v18 += v12[15] << 8;
-			v19 = v12[13];
-			v20 = v14 - v18 + v16;
-			if (v14 - v18 < v19)
-				v21 = &lightGrid->entries[v20];
-			else
-				v21 = 0i64;
-			entries[2] = v21;
-			if (v14 - v18 + 1 < v17[1])
-				v22 = &lightGrid->entries[(unsigned int)(v20 + 1)];
-			else
-				v22 = 0i64;
-			entries[3] = v22;
-			if (v14 < v18)
-				*defaultGridEntry = 0;
 		}
 
 		void fixup_entries(const game::GfxLightGrid* lightGrid, game::GfxLightGridEntry** entries)
@@ -404,26 +337,20 @@ namespace map_patches
 			nudgedGridPos[0] = (0.0099999998f * traceDir[0]) + gridPos[0];
 			nudgedGridPos[1] = (0.0099999998f * traceDir[1]) + gridPos[1];
 			nudgedGridPos[2] = (0.0099999998f * traceDir[2]) + gridPos[2];
-			game::Bounds bounds{};
+			game::Bounds bounds;
 			return SV_BrushModelSightTrace(0, samplePos, nudgedGridPos, &bounds, 0, 8193) == 0;
 		}
 
-		int R_LightGridLookup_IW(const game::GfxLightGrid* lightGrid, const float* samplePos, float* cornerWeight,
-			const game::GfxLightGridEntry** cornerEntryOut, unsigned short* defaultGridEntry)
-		{
-			// Early null checks for pointers
-			if (!lightGrid || !samplePos || !cornerWeight || !cornerEntryOut || !defaultGridEntry) {
-				return 0xFF;  // Invalid input data
-			}
+		int R_LightGridLookup_NonCompressed(const game::GfxLightGrid* lightGrid, const float* samplePos,
+			float* cornerWeight, game::GfxLightGridEntry* cornerEntryOut, unsigned int* defaultGridEntry) {
+
+			game::GfxLightGridEntry* entries[8];
 
 			unsigned int pos[3];
 			float axisLerp[3];
 			float quadWeight;
-			bool isDefaultEntryUsed = false;
-			float primaryLightEnvWeight = 0.0f;
-			unsigned short primaryLightEnvIndex = 0;
 
-			// Calculate position and interpolation along grid axes
+			// Compute grid position from sample position
 			int rowIdx = static_cast<int>(floorf(samplePos[0]));
 			int colIdx = static_cast<int>(floorf(samplePos[1]));
 			int layerIdx = static_cast<int>(floorf(samplePos[2]));
@@ -432,127 +359,141 @@ namespace map_patches
 			pos[1] = (colIdx + 0x20000) >> 5;
 			pos[2] = (layerIdx + 0x20000) >> 6;
 
-			axisLerp[lightGrid->rowAxis] = (samplePos[lightGrid->rowAxis] - -131072.0f) * 0.03125f - (float)pos[lightGrid->rowAxis];
-			axisLerp[lightGrid->colAxis] = (samplePos[lightGrid->colAxis] - -131072.0f) * 0.03125f - (float)pos[lightGrid->colAxis];
+			axisLerp[0] = (samplePos[lightGrid->rowAxis] - -131072.0f) * 0.03125f - (float)pos[lightGrid->rowAxis];
+			axisLerp[1] = (samplePos[lightGrid->colAxis] - -131072.0f) * 0.03125f - (float)pos[lightGrid->colAxis];
 			axisLerp[2] = (samplePos[2] - -131072.0f) * 0.015625f - (float)pos[2];
-
-			// Check that axisLerp values are within a valid range
-			for (int i = 0; i < 3; ++i) {
-				if (axisLerp[i] < 0.0f || axisLerp[i] > 1.0f) {
-					axisLerp[i] = std::clamp(axisLerp[i], 0.0f, 1.0f); // Clamp values between 0 and 1
-				}
-			}
-
-			// Calculate corner weights based on the axis interpolation
-			quadWeight = (1.0f - axisLerp[lightGrid->colAxis]) * (1.0f - axisLerp[2]);
-			cornerWeight[0] = (1.0f - axisLerp[lightGrid->rowAxis]) * quadWeight;
-			cornerWeight[4] = quadWeight * axisLerp[lightGrid->rowAxis];
-
-			quadWeight = (1.0f - axisLerp[lightGrid->colAxis]) * axisLerp[2];
-			cornerWeight[1] = (1.0f - axisLerp[lightGrid->rowAxis]) * quadWeight;
-			cornerWeight[5] = quadWeight * axisLerp[lightGrid->rowAxis];
-
-			quadWeight = axisLerp[lightGrid->colAxis] * (1.0f - axisLerp[2]);
-			cornerWeight[2] = (1.0f - axisLerp[lightGrid->rowAxis]) * quadWeight;
-			cornerWeight[6] = quadWeight * axisLerp[lightGrid->rowAxis];
-
-			quadWeight = axisLerp[lightGrid->colAxis] * axisLerp[2];
-			cornerWeight[3] = (1.0f - axisLerp[lightGrid->rowAxis]) * quadWeight;
-			cornerWeight[7] = quadWeight * axisLerp[lightGrid->rowAxis];
+			quadWeight = (1.0f - axisLerp[1]) * (1.0f - axisLerp[2]);
+			cornerWeight[0] = (1.0f - axisLerp[0]) * quadWeight;
+			cornerWeight[4] = quadWeight * axisLerp[0];
+			quadWeight = (1.0f - axisLerp[1]) * axisLerp[2];
+			cornerWeight[1] = (1.0f - axisLerp[0]) * quadWeight;
+			cornerWeight[5] = quadWeight * axisLerp[0];
+			quadWeight = (1.0f - axisLerp[2]) * axisLerp[1];
+			cornerWeight[2] = (1.0f - axisLerp[0]) * quadWeight;
+			cornerWeight[6] = quadWeight * axisLerp[0];
+			quadWeight = axisLerp[1] * axisLerp[2];
+			cornerWeight[3] = (1.0f - axisLerp[0]) * (axisLerp[1] * axisLerp[2]);
+			cornerWeight[7] = quadWeight * axisLerp[0];
 
 			*defaultGridEntry = 1;
 
-			// Sample light grid entries at the corners
-			R_GetLightGridSampleEntryQuad(lightGrid, pos, cornerEntryOut, defaultGridEntry);
+			// Sample light grid entries
+			R_GetLightGridSampleEntryQuad(lightGrid, pos, (const game::GfxLightGridEntry**)&entries[0], defaultGridEntry);
 			++pos[lightGrid->rowAxis];
-			R_GetLightGridSampleEntryQuad(lightGrid, pos, cornerEntryOut + 4, defaultGridEntry);
+			R_GetLightGridSampleEntryQuad(lightGrid, pos, (const game::GfxLightGridEntry**)&entries[4], defaultGridEntry);
 			--pos[lightGrid->rowAxis];
 
-			fixup_entries(lightGrid, const_cast<game::GfxLightGridEntry**>(cornerEntryOut));
+			fixup_entries(lightGrid, entries);
 
-			// Evaluate light grid entries at each corner
-			for (int i = 0; i < 8; ++i) {
-				const game::GfxLightGridEntry* entry = *(cornerEntryOut + i);
+			char v24 = 1;
+			game::GfxLightGridEntry* v25 = cornerEntryOut;
+			__int64 v41 = 0i64;
+			float v26 = 0.0;
+			unsigned short v27 = 0;
+			char defaultGridEntrya = 0;
+			char* v28 = (char*)((char*)entries - (char*)cornerEntryOut);
+			__int64* v40 = &v41;
+			unsigned int v29 = 0;
+			size_t v30 = 0i64;
 
-				// Null entry check
-				if (!entry || cornerWeight[i] < 0.001f) {
-					cornerWeight[i] = 0.0f;
-					continue;
+			game::GfxLightGridEntry* v31;
+			bool v32;
+			unsigned short v33;
+			float v34;
+
+			do
+			{
+				v31 = *(game::GfxLightGridEntry**)((char*)v25 + (unsigned __int64)v28);
+				if (!v31)
+				{
+					v25->colorsIndex = 0;
+					*cornerWeight = 0.0;
+					goto LABEL_19;
 				}
-
-				if (entry->needsTrace && !R_IsValidLightGridSample(lightGrid, entry, i, pos, samplePos)) {
-					if (isDefaultEntryUsed) {
-						cornerWeight[i] = 0.0f;
-						continue;
+				*v25 = *v31;
+				if (*cornerWeight < 0.001)
+				{
+					v25->colorsIndex = 0;
+					memset((game::GfxLightGridEntry*)((char*)v25 + (unsigned __int64)v28), 0, sizeof(game::GfxLightGridEntry));
+					*cornerWeight = 0.0;
+					goto LABEL_19;
+				}
+				v32 = ((unsigned __int8)v24 & v31->needsTrace) != 0 && !R_IsValidLightGridSample(lightGrid, v31, v29, pos, samplePos);
+				*(char*)v40 = v32;
+				if (v32)
+				{
+					if (defaultGridEntrya)
+					{
+						v25->colorsIndex = 0;
+						*cornerWeight = 0.0;
+						memset((game::GfxLightGridEntry*)((char*)v25 + (unsigned __int64)v28), 0, sizeof(game::GfxLightGridEntry));
+						goto LABEL_19;
 					}
 				}
-				else if (!isDefaultEntryUsed) {
-					primaryLightEnvWeight = cornerWeight[i];
-					primaryLightEnvIndex = entry->primaryLightEnvIndex;
-					isDefaultEntryUsed = true;
-					memset(cornerEntryOut, 0, i * sizeof(game::GfxLightGridEntry*)); // Properly reset the array
+				else if (!defaultGridEntrya)
+				{
+					v26 = *cornerWeight;
+					v27 = v31->primaryLightEnvIndex;
+					defaultGridEntrya = 1;
+					memset(cornerEntryOut, 0, v30);
+					memset(entries, 0, v30);
+					goto LABEL_19;
 				}
-
-				// Check if this entry is a better primary light environment
-				if (R_IsBetterPrimaryLightEnv(primaryLightEnvIndex, entry->primaryLightEnvIndex, primaryLightEnvWeight, cornerWeight[i])) {
-					primaryLightEnvWeight = cornerWeight[i];
-					primaryLightEnvIndex = entry->primaryLightEnvIndex;
+				v33 = v31->primaryLightEnvIndex;
+				v34 = *cornerWeight;
+				if (R_IsBetterPrimaryLightEnv(v27, v33, v26, *cornerWeight))
+				{
+					v26 = v34;
+					v27 = v33;
 				}
-			}
-
-			return primaryLightEnvIndex;
+			LABEL_19:
+				v40 = (__int64*)((char*)v40 + 1);
+				++v29;
+				v30 += 8i64;
+				++v25;
+				++cornerWeight;
+				v24 *= 2;
+			} while (v29 < 8);
+			/*v35 = 1;
+			if (frontEndDataOut && r_showLightGrid->current.integer == 1)
+			{
+				v36 = &v41;
+				v37 = entries;
+				v38 = 8i64;
+				do
+				{
+					v35 = __ROL4__(v35, 1);
+					v36 = (__int64*)((char*)v36 + 1);
+					++v37;
+					--v38;
+				} while (v38);
+			}*/
+			return v27;
 		}
+
+		game::dvar_t* r_lightGridNonCompressed;
 
 		utils::hook::detour r_lightgrid_lookup_hook;
 		int r_lightgrid_lookup_stub(game::GfxLightGrid* lightGrid, float* samplePos, GfxLightGridRaw* lightGridRaw, float* cornerWeight,
-			game::GfxLightGridEntry* cornerEntry, unsigned short* defaultGridEntry, float* referencePos, unsigned int smoothFetch)
+			game::GfxLightGridEntry* cornerEntry, unsigned int* defaultGridEntry, int a7, unsigned int a8)
 		{
-			auto primaryLightIndex = r_lightgrid_lookup_hook.invoke<int>(lightGrid, samplePos, lightGridRaw, cornerWeight, cornerEntry, defaultGridEntry, referencePos, smoothFetch);
+			auto primaryLightIndex = r_lightgrid_lookup_hook.invoke<int>(lightGrid, samplePos, lightGridRaw, cornerWeight, cornerEntry, defaultGridEntry, a7, a8);
+
+			auto address = _ReturnAddress();
+			if (address == (void*)0x6D6EE5_b)
+			{
+				return primaryLightIndex;
+			}
 
 			if (r_lightGridNonCompressed && r_lightGridNonCompressed->current.enabled)
 			{
 				if (lightGrid->entryCount)
 				{
-					bool effect_callback = false;
-					auto address = _ReturnAddress();
-					if (address == (void*)SELECT_VALUE(0x5BF0B5_b, 0x6D6EE5_b))
-					{
-						effect_callback = true;
-						//return primaryLightIndex;
-					}
+					primaryLightIndex = R_LightGridLookup_NonCompressed(lightGrid, samplePos, cornerWeight, cornerEntry, defaultGridEntry);
 
-					game::GfxLightGridEntry* entries[8] = { nullptr };
-					primaryLightIndex = R_LightGridLookup_IW(lightGrid, samplePos, cornerWeight, (const game::GfxLightGridEntry**)entries, defaultGridEntry);
-					for (auto i = 0; i < 8; i++)
-					{
-						if (entries[i])
-						{
-							memcpy(&cornerEntry[i], entries[i], sizeof(game::GfxLightGridEntry));
-						}
-					}
-
-					if (primaryLightIndex == 0xFF)
+					if (primaryLightIndex == 0xFF || primaryLightIndex == 0xFFFF) // iw3 max is 0xFF, iw4/iw5 max is 0xFFFF
 					{
 						primaryLightIndex = lightGrid->lastSunPrimaryLightIndex;
-					}
-
-					if (primaryLightIndex == 0xFFFF)
-					{
-						__debugbreak();
-					}
-
-					for (auto i = 0; i < 8; i++)
-					{
-						if (cornerEntry[i].primaryLightEnvIndex == 0xFF)
-						{
-							cornerEntry[i].primaryLightEnvIndex = static_cast<unsigned short>(lightGrid->lastSunPrimaryLightIndex);
-						}
-
-						// this is fucked idk
-						if (!effect_callback)
-						{
-							cornerEntry[i].unused = 0xFF;
-						}
 					}
 				}
 			}
@@ -560,259 +501,55 @@ namespace map_patches
 			return primaryLightIndex;
 		}
 
-		void R_AverageLightGridColors(const GfxLightGridColors_IW5* colors, float sunWeight, unsigned __int8* outColor)
+		namespace
 		{
-			int total[3] = { 0 };  // Array to store sum of RGB values
-			const int numSamples = 56;
+			typedef unsigned short ushort;
+			typedef unsigned int uint;
 
-			// Sum up RGB values across all samples
-			for (int i = 0; i < numSamples; ++i)
-			{
-				for (int j = 0; j < 3; ++j)
-				{
-					total[j] += colors->rgb[i][j];
-				}
+			uint as_uint(const float x) {
+				return *(uint*)&x;
+			}
+			float as_float(const uint x) {
+				return *(float*)&x;
 			}
 
-			// Calculate the average for each color and store it in outColor
-			for (int i = 0; i < 3; ++i)
-			{
-				outColor[i] = (unsigned __int8)(total[i] / numSamples);
+			float half_to_float(const ushort x) { // IEEE-754 16-bit floating-point format (without infinity): 1-5-10, exp-15, +-131008.0, +-6.1035156E-5, +-5.9604645E-8, 3.311 digits
+				const uint e = (x & 0x7C00) >> 10; // exponent
+				const uint m = (x & 0x03FF) << 13; // mantissa
+				const uint v = as_uint((float)m) >> 23; // evil log2 bit hack to count leading zeros in denormalized format
+				return as_float((x & 0x8000) << 16 | (e != 0) * ((e + 112) << 23 | m) | ((e == 0) & (m != 0)) * ((v - 37) << 23 | ((m << (150 - v)) & 0x007FE000))); // sign : normalized : denormalized
 			}
-
-			// Apply sun weight to the alpha channel
-			outColor[3] = (unsigned __int8)((sunWeight * 255.0f) + 0.5f);
+			ushort float_to_half(const float x) { // IEEE-754 16-bit floating-point format (without infinity): 1-5-10, exp-15, +-131008.0, +-6.1035156E-5, +-5.9604645E-8, 3.311 digits
+				const uint b = as_uint(x) + 0x00001000; // round-to-nearest-even: add last bit after truncated mantissa
+				const uint e = (b & 0x7F800000) >> 23; // exponent
+				const uint m = b & 0x007FFFFF; // mantissa; in line below: 0x007FF000 = 0x00800000-0x00001000 = decimal indicator flag - initial rounding
+				return (ushort)((b & 0x80000000) >> 16 | (e > 112) * ((((e - 112) << 10) & 0x7C00) | m >> 13) | ((e < 113) & (e > 101)) * ((((0x007FF000 + m) >> (125 - e)) + 1) >> 1) | (e > 143) * 0x7FFF); // sign : normalized : denormalized : saturate
+			}
 		}
 
-		void R_GetLightGridColorsFixedPointBlendWeights(
-			const float* colorsWeight,
-			unsigned int colorsCount,
-			float weightNormalizeScale,
-			uint16_t* fixedPointWeight,
-			uint16_t* a5)
+		void blend_colors(game::GfxLightGridColors* colorsa, game::GfxLightGridColors* colorsb, float blendFactor = 0.5f)
 		{
-			unsigned short v6; // r10
-			unsigned int v7; // r3
-			unsigned int v8; // r8
-			int v9; // r5
-			int v10; // r11
-			__int64 v11; // [sp+0h] [-10h]
-
-			v6 = 0;
-			v7 = 0;
-			v8 = 0;
-			v9 = 0;
-			v10 = 0;
-			do
+			for (auto i = 0; i < 56; i++)
 			{
-				v11 = (__int64)((*colorsWeight * (weightNormalizeScale * 256.0f)) + 0.5f);
-				a5[v10] = (unsigned short)v11;
-				v6 += (unsigned short)v11;
-				if (*(unsigned short*)((char*)a5 + v9) < (unsigned int)(unsigned short)v11)
+				for (auto channel = 0; channel < 3; channel++)
 				{
-					v7 = v8;
-					v9 = v10 * 2;
-				}
-				++v8;
-				++colorsWeight;
-				++v10;
-			} while (v8 < colorsCount);
-			a5[v7] = a5[v7] - v6 + 256;
-		}
+					auto a = half_to_float(colorsa->rgb[i][channel]) * 255.0f;
+					auto b = half_to_float(colorsb->rgb[i][channel]) * 255.0f;
 
-		void R_ScaleLightGridColors(const GfxLightGridColors_IW5* colors, unsigned short fixedPointWeight, unsigned short* scaled)
-		{
-			assert(colors);
+					auto val = a * (1.0f - blendFactor) + b * blendFactor;
 
-			int v3; // r11
-			int v4; // ctr
-			unsigned short* v6; // r10
-			unsigned short v7; // r4
-
-			v3 = 0;
-			v4 = 21;
-			v6 = scaled - 1;
-			do
-			{
-				v6[1] = colors->rgb[0][v3] * fixedPointWeight;
-				v6[2] = colors->rgb[0][v3 + 1] * fixedPointWeight;
-				v6[3] = colors->rgb[0][v3 + 2] * fixedPointWeight;
-				v6[4] = colors->rgb[1][v3] * fixedPointWeight;
-				v6[5] = colors->rgb[1][v3 + 1] * fixedPointWeight;
-				v6[6] = colors->rgb[1][v3 + 2] * fixedPointWeight;
-				v6[7] = colors->rgb[2][v3] * fixedPointWeight;
-				v7 = colors->rgb[2][v3 + 1] * fixedPointWeight;
-				v3 += 8;
-				v6 += 8;
-				*v6 = v7;
-				--v4;
-			} while (v4);
-		}
-
-		void R_WeightedAccumulateLightGridColors(const GfxLightGridColors_IW5* colors, unsigned short fixedPointWeight, unsigned short* accumulated)
-		{
-			int v3; // r10
-			int v4; // ctr
-			unsigned short* v5; // r11
-			unsigned short v6; // r31
-			unsigned short v7; // r30
-			unsigned short v8; // r29
-			unsigned short v9; // r28
-			unsigned short v10; // r20
-			unsigned short v11; // r6
-			unsigned short v12; // r5
-			short v13; // r8
-
-			v3 = 0;
-			v4 = 21;
-			v5 = accumulated - 1;
-			do
-			{
-				v6 = v5[4];
-				v7 = v5[5];
-				v8 = v5[6];
-				v9 = v5[7];
-				v10 = v5[8];
-				v11 = v5[2];
-				v12 = v5[3];
-				v5[1] += colors->rgb[0][v3] * fixedPointWeight;
-				v5[2] = colors->rgb[0][v3 + 1] * fixedPointWeight + v11;
-				v5[3] = colors->rgb[0][v3 + 2] * fixedPointWeight + v12;
-				v5[4] = colors->rgb[1][v3] * fixedPointWeight + v6;
-				v5[5] = colors->rgb[1][v3 + 1] * fixedPointWeight + v7;
-				v5[6] = colors->rgb[1][v3 + 2] * fixedPointWeight + v8;
-				v5[7] = colors->rgb[2][v3] * fixedPointWeight + v9;
-				v13 = colors->rgb[2][v3 + 1] * fixedPointWeight;
-				v3 += 8;
-				v5 += 8;
-				*v5 = v13 + v10;
-				--v4;
-			} while (v4);
-		}
-
-		void R_PackAccumulatedLightGridColors(const unsigned short* accumulated, GfxLightGridColors_IW5* packed)
-		{
-			int v2; // r11
-			int v3; // ctr
-			const unsigned short* v4; // r10
-
-			v2 = 0;
-			v3 = 21;
-			v4 = accumulated - 1;
-			do
-			{
-				packed->rgb[0][v2] = (unsigned short)(v4[1] + 127) >> 8;
-				packed->rgb[0][v2 + 1] = (unsigned short)(v4[2] + 127) >> 8;
-				packed->rgb[0][v2 + 2] = (unsigned short)(v4[3] + 127) >> 8;
-				packed->rgb[1][v2] = (unsigned short)(v4[4] + 127) >> 8;
-				packed->rgb[1][v2 + 1] = (unsigned short)(v4[5] + 127) >> 8;
-				packed->rgb[1][v2 + 2] = (unsigned short)(v4[6] + 127) >> 8;
-				packed->rgb[2][v2] = (unsigned short)(v4[7] + 127) >> 8;
-				v4 += 8;
-				packed->rgb[2][v2 + 1] = (unsigned short)(*v4 + 127) >> 8;
-				v2 += 8;
-				--v3;
-			} while (v3);
-		}
-
-		void __fastcall R_FixedPointBlendLightGridColors(const game::GfxLightGrid* lightGrid, const unsigned short* colorsIndex, const unsigned short* fixedPointWeight,
-			unsigned int colorsCount, GfxLightGridColors_IW5* outPacked, const float* heroLightSamplePos, const float(*heroAmbient)[3], const float(*viewModelAmbient)[3])
-		{
-			const unsigned short* v16; // r31
-			unsigned int v17; // r30
-			__int64 v18; // r29
-			unsigned short v19[216]; // [sp+50h] [-1B0h] BYREF
-
-			GfxLightGridColors_IW5 colors{};
-
-			GetColors(&lightGrid->colors[*colorsIndex], &colors);
-			R_ScaleLightGridColors(&colors, *fixedPointWeight, v19);
-			v16 = colorsIndex + 1;
-			v17 = 1;
-			v18 = fixedPointWeight - colorsIndex;
-			do
-			{
-				GetColors(&lightGrid->colors[*v16], &colors);
-				R_WeightedAccumulateLightGridColors(&colors, *(v16 + v18), v19);
-				++v17;
-				++v16;
-			} while (v17 < colorsCount);
-			/*if (viewModelAmbient || heroAmbient || heroLightSamplePos)
-			{
-				R_AddHeroOnlyLightsToGridColors(v19, heroLightSamplePos, heroAmbient, viewModelAmbient);
-				if (r_lightGridEnableTweaks->current.enabled
-					&& r_lightGridUseTweakedValues->current.enabled
-					&& r_heroLighting->current.enabled)
-				{
-					R_AdjustLightColorSamples(v19);
-				}
-			}*/
-			R_PackAccumulatedLightGridColors(v19, outPacked);
-		}
-
-		void R_BlendAndAverageLightGridColors(const game::GfxLightGrid* lightGrid, const unsigned short* colorsIndex, const float* colorsWeight, unsigned int colorsCount,
-			float primaryLightWeight, float weightNormalizeScale, unsigned __int8* outAverage)
-		{
-			const unsigned short* v13; // r31
-			unsigned int v14; // r30
-			__int64 v15; // r29
-			float v17; // fp9
-			unsigned short v18[8]; // [sp+50h] [-250h] BYREF
-			GfxLightGridColors_IW5 v19; // [sp+60h] [-240h] BYREF
-			unsigned short v20[200]; // [sp+110h] [-190h] BYREF
-
-			v17 = 1.0f;
-
-			GfxLightGridColors_IW5 colors{};
-
-			R_GetLightGridColorsFixedPointBlendWeights(
-				colorsWeight,
-				colorsCount,
-				weightNormalizeScale,
-				(unsigned short*)colorsWeight,
-				v18);
-
-			GetColors(&lightGrid->colors[*colorsIndex], &colors);
-			R_ScaleLightGridColors(&colors, v18[0], v20);
-			v13 = colorsIndex + 1;
-			v14 = 1;
-			v15 = (char*)v18 - (char*)colorsIndex;
-			do
-			{
-				GetColors(&lightGrid->colors[*v13], &colors);
-				R_WeightedAccumulateLightGridColors(&colors, *(const unsigned short*)((char*)v13 + v15), v20);
-				++v14;
-				++v13;
-			} while (v14 < colorsCount);
-			R_PackAccumulatedLightGridColors(v20, &v19);
-			R_AverageLightGridColors(&v19, v17, outAverage);
-		}
-
-		utils::hook::detour r_get_lightgrid_average_color_hook;
-		void r_get_lightgrid_average_color_stub(game::GfxLightGrid* lightGrid, unsigned int colorIndex, float* rgb)
-		{
-			if (r_lightGridNonCompressed && r_lightGridNonCompressed->current.enabled)
-			{
-				if (lightGrid->colors)
-				{
-					GfxLightGridColors_IW5 colors_iw5{};
-					unsigned char rgba[4]{};
-					GetColors(&lightGrid->colors[colorIndex], &colors_iw5);
-					R_AverageLightGridColors(&colors_iw5, 1.0f, rgba);
-
-					rgb[0] = rgba[0] / 255.0f;
-					rgb[1] = rgba[1] / 255.0f;
-					rgb[2] = rgba[2] / 255.0f;
-					return;
+					colorsa->rgb[i][channel] = float_to_half(val / 255.0f);
 				}
 			}
-
-			r_get_lightgrid_average_color_hook.invoke<void>(lightGrid, colorIndex, rgb);
 		}
 
-		utils::hook::detour r_get_lightgrid_colors_from_indices_hook;
-		void r_get_lightgrid_colors_from_indices_stub(game::GfxLightGrid* lightGrid, unsigned int* colorsIndex, float* colorsWeight, int colorsCount, float primaryLightWeight,
-			float weightNormalizeScale, GfxHeroLightParams* heroLightParams, game::GfxLightGridColors* colors, short* viewModelAmbient)
+		struct GfxLightGridColors_IW4
+		{
+			unsigned char rgb[56][3];
+		};
+
+		utils::hook::detour sub_6D66A0_hook;
+		void sub_6D66A0_stub(game::GfxLightGrid* lightGrid, unsigned int* colorsIndex, float* colorsWeight, int colorsCount, float a5, int a6, unsigned int* a7, game::GfxLightGridColors* colors, __int16* viewModelAmbient)
 		{
 			if (r_lightGridNonCompressed && r_lightGridNonCompressed->current.enabled)
 			{
@@ -825,142 +562,28 @@ namespace map_patches
 					}
 					else
 					{
-						memset(colors, 0, sizeof(game::GfxLightGridColors));
-
-						unsigned short v19[8]{};
-						*(unsigned __int64*)v19 = (__int64)(float)((float)((float)primaryLightWeight * 255.0f) + 0.5f);
-
-						R_GetLightGridColorsFixedPointBlendWeights(
-							colorsWeight,
-							colorsCount,
-							weightNormalizeScale,
-							(unsigned short*)colorsWeight,
-							v19);
-
-						unsigned short colorsIndex_2[8] = {};
 						for (auto i = 0; i < colorsCount; i++)
 						{
-							colorsIndex_2[i] = static_cast<unsigned short>(colorsIndex[i]);
+							if (i == 0)
+							{
+								memcpy(colors, &lightGrid->colors[colorsIndex[i]], sizeof(game::GfxLightGridColors));
+							}
+							else
+							{
+								blend_colors(colors, &lightGrid->colors[colorsIndex[i]]);
+							}
 						}
-
-						GfxLightGridColors_IW5 iw5_colors{};
-						R_FixedPointBlendLightGridColors(lightGrid, colorsIndex_2, v19, colorsCount, &iw5_colors, nullptr, nullptr, nullptr);
-
-						GetColors(&iw5_colors, colors);
 					}
 
 					if (viewModelAmbient)
 					{
-						__debugbreak();
+						__debugbreak();//
 					}
 					return;
 				}
 			}
 
-			r_get_lightgrid_colors_from_indices_hook.invoke<void>(lightGrid, colorsIndex, colorsWeight, colorsCount, primaryLightWeight, weightNormalizeScale, heroLightParams, colors, viewModelAmbient);
-		}
-
-		utils::hook::detour r_get_lighting_info_for_effects_hook;
-		void r_get_lighting_info_for_effects_stub(float* samplePos, char tryUseCache, float radiometricUnit, float* outColor, GfxPrimaryLightsAndWeights* outPrimaryLightsAndWeights)
-		{
-			if (r_lightGridNonCompressed && r_lightGridNonCompressed->current.enabled)
-			{
-				auto* world = (*s_world);
-				if (world->lightGrid.colors)
-				{
-					r_get_lighting_info_for_effects_hook.invoke<void>(samplePos, 0, radiometricUnit, outColor, outPrimaryLightsAndWeights);
-					return;
-				}
-			}
-
-			r_get_lighting_info_for_effects_hook.invoke<void>(samplePos, tryUseCache, radiometricUnit, outColor, outPrimaryLightsAndWeights);
-		}
-	}
-
-	namespace
-	{
-		void* cg_trigger_update_stub()
-		{
-			return utils::hook::assemble([](utils::hook::assembler& a)
-			{
-				const auto patch = a.newLabel();
-
-				a.jnb(patch);
-
-				a.mov(dword_ptr(rdi, 0x179914), eax);
-				a.mov(r15d, eax);
-				a.mov(r14, 0xA975F40_b);
-				a.jmp(0x120FA6_b);
-
-				a.bind(patch);
-				a.mov(dword_ptr(rdi, 0x179918), 0xFFFFFFFF);
-				a.jmp(0x121035_b);
-			});
-		}
-	}
-
-	namespace
-	{
-		enum leaf_table_version : std::int8_t
-		{
-			h2 = 0i8,
-			h1 = 0i8,
-			s1 = 0i8,
-			iw6 = 1i8,
-		};
-
-		struct LightGridLeafIndexRaw
-		{
-			int indexMin;
-			int indexBitCount;
-			int indexDefault;
-			int indexTable[16];
-		};
-
-		struct LightGridLeafRaw
-		{
-			unsigned __int8 format;
-			LightGridLeafIndexRaw colorIndex;
-			LightGridLeafIndexRaw lightIndex;
-			unsigned int voxels;
-		};
-
-		struct LightGridNodeIndexRaw
-		{
-			unsigned __int8 indexBitCount;
-			unsigned __int8 indexTableSize;
-			unsigned __int8 indexTableSizeBitCount;
-			int indexMin;
-			int indexDefault;
-			int indexTable[15];
-		};
-
-		struct LightGridNodeRaw
-		{
-			LightGridNodeIndexRaw colorIndex;
-			LightGridNodeIndexRaw lightIndex;
-		};
-
-		utils::hook::detour r_decode_light_grid_block_hook;
-		void r_decode_light_grid_block_stub(game::GfxLightGridTree* p_tree, int child_mask,
-			char child_index, int encoded_node_address, LightGridNodeRaw* p_node_raw, LightGridLeafRaw* p_leaf_raw)
-		{
-			static const auto p_address = SELECT_VALUE(0x57BCCE_b + 1, 0x6A032E_b + 1);
-			auto value = *(uint8_t*)p_address;
-			if (p_tree->unused[0] == leaf_table_version::iw6)
-			{
-				if (value != 6)
-				{
-					utils::hook::set<uint8_t>(p_address, 6); // iw6
-				}
-			}
-			else if (value != 7)
-			{
-				utils::hook::set<uint8_t>(p_address, 7); // s1,h1,h2
-			}
-
-			r_decode_light_grid_block_hook.invoke<void>(p_tree, child_mask,
-				child_index, encoded_node_address, p_node_raw, p_leaf_raw);
+			sub_6D66A0_hook.invoke<void>(lightGrid, colorsIndex, colorsWeight, colorsCount, a5, a6, a7, colors, viewModelAmbient);
 		}
 	}
 
@@ -970,27 +593,19 @@ namespace map_patches
 		void post_unpack() override
 		{
 			// skip fx name prefix checks
-			if (game::environment::is_mp())
-			{
-				utils::hook::set<uint8_t>(0x2F377D_b, 0xEB); // createfx parse
-				utils::hook::set<uint8_t>(0x4444E0_b, 0xEB); // scr_loadfx
+			utils::hook::set<uint8_t>(0x2F377D_b, 0xEB); // createfx parse
+			utils::hook::set<uint8_t>(0x4444E0_b, 0xEB); // scr_loadfx
 
-				// patch static model lighting
-				utils::hook::set<uint8_t>(0x6971EF_b, 0xEB);
-				utils::hook::nop(0x697249_b, 2);
+			// patch iw6 leafTable decoding
+			r_decode_light_grid_block_hook.create(0x69E7D0_b, r_decode_light_grid_block_stub);
 
-				// patch iw6 leafTable decoding
-				map_patches::r_decode_light_grid_block_hook.create(0x69E7D0_b, map_patches::r_decode_light_grid_block_stub);
+			//utils::hook::set<uint8_t>(0x6D65E0_b, 0xC3);
+			//utils::hook::nop(0x6D6A70_b, 2);
+			r_lightGridNonCompressed = dvars::register_bool("r_lightGridNonCompressed", false, game::DVAR_FLAG_REPLICATED, "Use old lightgrid data, if available.");
 
-				// patch vision set triggers to behave like old games
-				utils::hook::jump(0x120F90_b, cg_trigger_update_stub(), true);
-			}
+			r_lightgrid_lookup_hook.create(0x6D8120_b, r_lightgrid_lookup_stub);
 
-			r_lightGridNonCompressed = dvars::register_bool("r_lightGridNonCompressed", true, game::DVAR_FLAG_REPLICATED, "Use old lightgrid data, if available.");
-			r_lightgrid_lookup_hook.create(SELECT_VALUE(0x5C02F0_b, 0x6D8120_b), r_lightgrid_lookup_stub);
-			r_get_lightgrid_colors_from_indices_hook.create(SELECT_VALUE(0x5BE870_b, 0x6D66A0_b), r_get_lightgrid_colors_from_indices_stub);
-			r_get_lightgrid_average_color_hook.create(SELECT_VALUE(0x5BE7B0_b, 0x6D65E0_b), r_get_lightgrid_average_color_stub);
-			r_get_lighting_info_for_effects_hook.create(SELECT_VALUE(0x5BEF20_b, 0x6D6D50_b), r_get_lighting_info_for_effects_stub);
+			sub_6D66A0_hook.create(0x6D66A0_b, sub_6D66A0_stub);
 		}
 	};
 }

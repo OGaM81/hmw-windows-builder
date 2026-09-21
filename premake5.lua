@@ -1,4 +1,4 @@
-gitVersioningCommand = "git describe --tags --dirty --always"
+gitVersioningCommand = "git describe --tags --always --abbrev=0"
 gitCurrentBranchCommand = "git symbolic-ref -q --short HEAD"
 
 -- Quote the given string input as a C string
@@ -228,7 +228,7 @@ targetdir "%{wks.location}/bin/%{cfg.platform}/%{cfg.buildcfg}"
 configurations {"Debug", "Release"}
 
 language "C++"
-cppdialect "C++23"
+cppdialect "C++20"
 
 architecture "x86_64"
 platforms "x64"
@@ -239,6 +239,10 @@ staticruntime "On"
 editandcontinue "Off"
 warnings "Extra"
 characterset "ASCII"
+
+if _OPTIONS["dev-build"] then
+	defines {"DEV_BUILD"}
+end
 
 if os.getenv("CI") then
 	defines {"CI"}
@@ -255,7 +259,7 @@ filter "configurations:Release"
 	buildoptions {"/GL"}
 	linkoptions { "/IGNORE:4702", "/LTCG" }
 	defines {"NDEBUG"}
-	fatalwarnings { "All" }
+	flags {"FatalCompileWarnings"}
 filter {}
 
 filter "configurations:Debug"
@@ -276,6 +280,20 @@ resincludedirs {"$(ProjectDir)src"}
 
 dependencies.imports()
 
+project "runner"
+kind "WindowedApp"
+language "C++"
+
+files {"./src/runner/**.rc", "./src/runner/**.hpp", "./src/runner/**.cpp", "./src/runner/resources/**.*"}
+
+includedirs {"./src/client", "./src/common", "%{prj.location}/src", "./deps/mongoose"}
+
+resincludedirs {"$(ProjectDir)src"}
+
+links {"common"}
+
+dependencies.imports()
+
 project "client"
 kind "ConsoleApp"
 language "C++"
@@ -293,7 +311,7 @@ includedirs {"./src/client", "./src/common", "%{prj.location}/src"}
 
 resincludedirs {"$(ProjectDir)src"}
 
-dependson {"tlsdll"}
+dependson {"tlsdll", "runner"}
 
 links {"common"}
 
@@ -301,19 +319,6 @@ prebuildcommands {"pushd %{_MAIN_SCRIPT_DIR}", "tools\\premake5 generate-buildin
 
 if _OPTIONS["copy-to"] then
 	postbuildcommands {"copy /y \"$(TargetPath)\" \"" .. _OPTIONS["copy-to"] .. "\""}
-end
-
-if os.getenv("AURORAH1_GAME_PATH") then
-	debugdir "$(AURORAH1_GAME_PATH)"
-	debugcommand "$(AURORAH1_GAME_PATH)\\$(TargetName)$(TargetExt)"
-	postbuildcommands {
-		"echo Copying to Aurora H1-mod game path...",
-		"copy /y \"$(OutDir)$(TargetName)$(TargetExt)\" \"$(AURORAH1_GAME_PATH)\\$(TargetName)$(TargetExt)\""
-	}
-end
-
-if os.getenv("COMPUTERNAME") == "DESKTOP-JDO25VF" then
-	targetdir "D:\\SteamLibrary\\steamapps\\common\\Call of Duty Modern Warfare Remastered"
 end
 
 if _OPTIONS["debug-dir"] then
@@ -333,6 +338,22 @@ includedirs {"./src/tlsdll", "%{prj.location}/src"}
 links {"common"}
 
 resincludedirs {"$(ProjectDir)src"}
+
+project "runner"
+kind "WindowedApp"
+language "C++"
+
+files {"./src/runner/**.rc", "./src/runner/**.hpp", "./src/runner/**.cpp", "./src/runner/resources/**.*"}
+
+includedirs {"./src/runner", "./src/common", "%{prj.location}/src"}
+
+links {"common"}
+
+resincludedirs {"$(ProjectDir)src"}
+
+links {"common"}
+
+dependencies.imports()
 
 group "Dependencies"
 dependencies.projects()

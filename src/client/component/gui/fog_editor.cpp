@@ -1,6 +1,6 @@
 #include <std_include.hpp>
 
-#ifdef _DEBUG
+#ifdef DEBUG
 #include "loader/component_loader.hpp"
 
 #include "game/game.hpp"
@@ -178,7 +178,7 @@ namespace gui::fog_editor
 	public:
 		void post_unpack() override
 		{
-			if (game::environment::is_dedi() || game::environment::is_sp())
+			if (game::environment::is_dedi())
 			{
 				return;
 			}

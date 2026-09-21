@@ -11,12 +11,56 @@
 
 #include <utils/hook.hpp>
 #include <utils/string.hpp>
+#include <utils/http.hpp>
+
+#include "tcp/hmw_tcp_utils.hpp"
 
 namespace dedicated
 {
 	namespace
 	{
-		const game::dvar_t* sv_lanOnly = nullptr;
+		int get_dvar_int(const std::string& dvar)
+		{
+			auto* dvar_value = game::Dvar_FindVar(dvar.data());
+			if (dvar_value && dvar_value->current.integer)
+			{
+				return dvar_value->current.integer;
+			}
+
+			return -1;
+		}
+
+		std::string get_dvar_netip()
+		{
+			const std::string& dvar = "net_ip";
+			auto* dvar_value = game::Dvar_FindVar(dvar.data());
+			if (dvar_value && dvar_value->current.string)
+			{
+				std::string ip_str = dvar_value->current.string;
+				struct sockaddr_in sa;
+				if (inet_pton(AF_INET, ip_str.c_str(), &(sa.sin_addr)) == 1) {
+					console::info("Resolved net_ip address: %s", ip_str.c_str());
+					return ip_str;
+				}
+				else {
+					console::error("Invalid IP using default 0.0.0.0 instead of %s", ip_str.c_str());
+				}
+			}
+
+			return "0.0.0.0";
+		}
+
+
+		utils::hook::detour gscr_set_dynamic_dvar_hook;
+		utils::hook::detour com_quit_f_hook;
+
+		const game::dvar_t* sv_lanOnly;
+		const game::dvar_t* net_ip;
+
+		inline bool sv_is_lanOnly()
+		{
+			return (sv_lanOnly && sv_lanOnly->current.enabled);
+		}
 
 		void init_dedicated_server()
 		{
@@ -28,24 +72,18 @@ namespace dedicated
 			utils::hook::invoke<void>(0x686310_b);
 		}
 
-		void sv_kill_server_f()
-		{
-			game::Com_Shutdown("EXE_SERVERKILLED");
-		}
-
 		void send_heartbeat()
 		{
-			if (sv_lanOnly && sv_lanOnly->current.enabled)
+			if (sv_is_lanOnly())
 			{
 				return;
 			}
 
-			game::netadr_s target{};
-			if (server_list::get_master_server(target))
+			// send heartbeat asynchronously to master so we don't freeze the main game thread
+			scheduler::once([]()
 			{
-				console::info("Sending heartbeat");
-				network::send(target, "heartbeat", "H1");
-			}
+				hmw_tcp_utils::MasterServer::send_heartbeat();
+			}, scheduler::pipeline::async);
 		}
 
 		std::vector<std::string>& get_startup_command_queue()
@@ -115,6 +153,43 @@ namespace dedicated
 			std::this_thread::sleep_for(std::chrono::milliseconds(msec));
 		}
 
+		void kill_server()
+		{
+			const auto* svs_clients = *game::svs_clients;
+			if (svs_clients != nullptr)
+			{
+				for (auto i = 0; i < *game::svs_numclients; ++i)
+				{
+					if (svs_clients[i].header.state >= 3)
+					{
+						game::SV_GameSendServerCommand(i, game::SV_CMD_CAN_IGNORE,
+							utils::string::va("r \"%s\"", "EXE_ENDOFGAME"));
+					}
+				}
+			}
+
+			com_quit_f_hook.invoke<void>();
+		}
+
+		void sys_error_stub(const char* msg, ...)
+		{
+			char buffer[2048]{};
+
+			va_list ap;
+			va_start(ap, msg);
+
+			vsnprintf_s(buffer, _TRUNCATE, msg, ap);
+
+			va_end(ap);
+
+			scheduler::once([]
+			{
+				command::execute("map_rotate");
+			}, scheduler::main, 3s);
+
+			game::Com_Error(game::ERR_DROP, "%s", buffer);
+		}
+
 		utils::hook::detour ui_set_active_menu_hook;
 		void ui_set_active_menu_stub(void* localClientNum, int menu)
 		{
@@ -133,6 +208,13 @@ namespace dedicated
 		}
 	}
 
+	void initialize()
+	{
+		command::execute("exec default_xboxlive.cfg", true);
+		command::execute("onlinegame 1", true);
+		command::execute("xblive_privatematch 1", true);
+	}
+
 	class component final : public component_interface
 	{
 	public:
@@ -148,9 +230,7 @@ namespace dedicated
 				return;
 			}
 
-#ifdef _DEBUG
 			printf("Starting dedicated server\n");
-#endif
 
 			// Register dedicated dvar
 			dvars::register_bool("dedicated", true, game::DVAR_FLAG_READ, "Dedicated server");
@@ -158,11 +238,19 @@ namespace dedicated
 			// Add lanonly mode
 			sv_lanOnly = dvars::register_bool("sv_lanOnly", false, game::DVAR_FLAG_NONE, "Don't send heartbeat");
 
+			scheduler::once([]()
+			{
+				net_ip = dvars::register_string("net_ip", "0.0.0.0", game::DVAR_FLAG_NONE, "Network ip");
+				std::cout << "Set default ip: 0.0.0.0" << std::endl;
+				command::read_startup_variable("net_ip");
+			}, scheduler::pipeline::main);
+
+
 			// Disable VirtualLobby
 			dvars::override::register_bool("virtualLobbyEnabled", false, game::DVAR_FLAG_READ);
 
-			// Disable r_preloadShaders
-			dvars::override::register_bool("r_preloadShaders", false, game::DVAR_FLAG_READ);
+			// Stop crashing from sys_errors
+			utils::hook::jump(0x1D8710_b, sys_error_stub, true);
 
 			// Hook R_SyncGpu
 			utils::hook::jump(0x688620_b, sync_gpu_stub, true);
@@ -249,9 +337,9 @@ namespace dedicated
 			utils::hook::set<uint8_t>(0x4F7C10_b, 0xC3); // render synchronization lock
 			utils::hook::set<uint8_t>(0x4F7B40_b, 0xC3); // render synchronization unlock
 
-			utils::hook::set<uint8_t>(0x27AA9D_b, 0xEB); // LUI: Unable to start the LUI system due to errors in main.lua
-			utils::hook::set<uint8_t>(0x27AAC5_b, 0xEB); // LUI: Unable to start the LUI system due to errors in depot.lua
-			utils::hook::set<uint8_t>(0x27AADC_b, 0xEB); // ^
+			//utils::hook::set<uint8_t>(0x27AA9D_b, 0xEB); // LUI: Unable to start the LUI system due to errors in main.lua
+			//utils::hook::set<uint8_t>(0x27AAC5_b, 0xEB); // LUI: Unable to start the LUI system due to errors in depot.lua
+			//utils::hook::set<uint8_t>(0x27AADC_b, 0xEB); // ^
 
 			utils::hook::nop(0x5B25BE_b, 5); // Disable sound pak file loading
 			utils::hook::nop(0x5B25C6_b, 2); // ^
@@ -273,38 +361,55 @@ namespace dedicated
 				if (game::Live_SyncOnlineDataFlags(0) == 32 && game::Sys_IsDatabaseReady2())
 				{
 					scheduler::once([]
-					{
-						command::execute("xstartprivateparty", true);
-						command::execute("disconnect", true); // 32 -> 0
-					}, scheduler::pipeline::main, 1s);
+						{
+							command::execute("xstartprivateparty", true);
+							command::execute("disconnect", true); // 32 -> 0
+						}, scheduler::pipeline::main, 1s);
 					return scheduler::cond_end;
 				}
 
 				return scheduler::cond_continue;
 			}, scheduler::pipeline::main, 1s);
 
+			scheduler::once([]()
+			{
+				dvars::register_string("sv_serverkey", "", game::DVAR_FLAG_NONE, "Server key to authenticate to server list");
+			}, scheduler::pipeline::main);
+
 			scheduler::on_game_initialized([]
 			{
-				command::execute("exec default_xboxlive.cfg", true);
-				command::execute("onlinegame 1", true);
-				command::execute("xblive_privatematch 1", true);
+				initialize();
 
 				console::info("==================================\n");
 				console::info("Server started!\n");
 				console::info("==================================\n");
 
+				// remove disconnect command
 				game::Cmd_RemoveCommand("disconnect");
 
 				execute_startup_command_queue();
 				execute_console_command_queue();
 
+				bool dedicated = game::environment::is_dedi();
+				std::cout << "Dedicated: " << std::to_string(dedicated) << std::endl;
+
+				if (dedicated) {
+					std::string port = utils::string::va("%i", get_dvar_int("net_port"));
+
+					std::string net_ip = get_dvar_netip();
+					const std::string url = "http://"+ net_ip +":" + port;
+
+					hmw_tcp_utils::GameServer::start_server(url);
+				}
+
 				// Send heartbeat to master
-				scheduler::once(send_heartbeat, scheduler::pipeline::server);
-				scheduler::loop(send_heartbeat, scheduler::pipeline::server, 10min);
+				scheduler::once(send_heartbeat, scheduler::pipeline::network);
+				scheduler::loop(send_heartbeat, scheduler::pipeline::network, 2min);
 				command::add("heartbeat", send_heartbeat);
 			}, scheduler::pipeline::main, 1s);
 
-			command::add("killserver", sv_kill_server_f);
+			command::add("killserver", kill_server);
+			com_quit_f_hook.create(0x17CD00_b, kill_server);
 		}
 	};
 }

@@ -4,8 +4,6 @@
 #include <stb_image.h>
 #include <gsl/gsl>
 
-#include <stdexcept>
-
 namespace utils
 {
 	image::image(const std::string& image_data)

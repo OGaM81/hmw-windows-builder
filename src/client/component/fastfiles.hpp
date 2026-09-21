@@ -13,7 +13,7 @@ namespace fastfiles
 
 	void close_fastfile_handles();
 
-	std::string get_zone_name(const unsigned int index);
+	const char* get_zone_name(const unsigned int index);
 
 	void set_usermap(const std::string& usermap);
 	void clear_usermap();

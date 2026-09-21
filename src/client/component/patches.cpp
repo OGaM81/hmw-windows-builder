@@ -14,17 +14,81 @@
 #include "game/game.hpp"
 #include "game/dvars.hpp"
 
+#include <utils/io.hpp>
 #include <utils/hook.hpp>
 #include <utils/string.hpp>
 #include <utils/flags.hpp>
+#include "clantag_utils.hpp"
+#include <utils/obfus.hpp>
+
 
 namespace patches
 {
 	namespace
 	{
+
+		static inline void to_lowercase(std::string& input)
+		{
+			std::transform(input.begin(), input.end(), input.begin(),
+				[](unsigned char c) { return std::tolower(c); });
+		}
+
+		static inline void to_uppercase(std::string& input)
+		{
+			std::transform(input.begin(), input.end(), input.begin(),
+				[](unsigned char c) { return std::toupper(c); });
+		}
+
+		static inline void remove_all_occurrences(std::string& text, std::string_view target)
+		{
+			std::string lowercase_text = text;
+			to_lowercase(lowercase_text);
+			std::string lowercase_target(target);
+			to_lowercase(lowercase_target);
+			size_t pos = 0;
+			while ((pos = lowercase_text.find(lowercase_target, pos)) != std::string::npos)
+			{
+				text.erase(pos, target.length());
+				lowercase_text.erase(pos, target.length());
+			}
+		}
+
+		static inline void remove_color_codes(std::string& text)
+		{
+			static const std::array<std::string_view, 11> color_codes = {
+				"^0", "^1", "^2", "^3", "^4", "^5", "^6", "^7", "^8", "^9", "^:"
+			};
+			for (const auto& code : color_codes)
+			{
+				remove_all_occurrences(text, code);
+			}
+		}
+
+		static inline void remove_material_handles(std::string& text)
+		{
+			remove_all_occurrences(text, "^\x01");
+			remove_all_occurrences(text, "^\x02");
+		}
+
+		static inline void clean_text(std::string& text)
+		{
+			remove_color_codes(text);
+			remove_material_handles(text);
+		}
+
 		const char* live_get_local_client_name()
 		{
-			return game::Dvar_FindVar("name")->current.string;
+			std::string name = game::Dvar_FindVar("name")->current.string;
+			clean_text(name); 
+			// Remove characters in the range from 0x01 to 0x20
+			name.erase(std::remove_if(name.begin(), name.end(), [](unsigned char c) {
+				return (c >= 0x01 && c <= 0x20);
+				}), name.end());
+			// Copy the cleaned name into a static string to avoid memory problems
+			static std::string safe_name;
+			safe_name = name.empty() ? "Unknown Soldier" : name;
+
+			return safe_name.c_str();
 		}
 
 		utils::hook::detour sv_kick_client_num_hook;
@@ -39,6 +103,7 @@ namespace patches
 			return sv_kick_client_num_hook.invoke<void>(client_num, reason);
 		}
 
+		// Force name set to "Unknown Soldier" if it contains hex 01 to 20
 		std::string get_login_username()
 		{
 			char username[UNLEN + 1];
@@ -48,7 +113,12 @@ namespace patches
 				return "Unknown Soldier";
 			}
 
-			return std::string{username, username_len - 1};
+			std::string user_name_str{ username, username_len - 1 };
+			user_name_str.erase(std::remove_if(user_name_str.begin(), user_name_str.end(), [](unsigned char c) {
+				return (c >= 0x01 && c <= 0x20);
+				}), user_name_str.end());
+
+			return user_name_str.empty() ? "Unknown Soldier" : user_name_str;
 		}
 
 		utils::hook::detour com_register_dvars_hook;
@@ -126,18 +196,23 @@ namespace patches
 			return true;
 		}
 
-		utils::hook::detour db_read_raw_file_hook;
 		const char* db_read_raw_file_stub(const char* filename, char* buf, const int size)
 		{
+			std::string file_name = filename;
+			if (file_name.find(".cfg") == std::string::npos)
+			{
+				file_name.append(".cfg");
+			}
+
 			std::string buffer{};
-			if (filesystem::read_file(filename, &buffer))
+			if (filesystem::read_file(file_name, &buffer))
 			{
 				snprintf(buf, size, "%s\n", buffer.data());
 				return buf;
 			}
 
 			// DB_ReadRawFile
-			return db_read_raw_file_hook.invoke<const char*>(filename, buf, size);
+			return utils::hook::invoke<const char*>(0x3994B0_b, filename, buf, size);
 		}
 
 		void bsp_sys_error_stub(const char* error, const char* arg1)
@@ -157,9 +232,9 @@ namespace patches
 		}
 
 		utils::hook::detour cmd_lui_notify_server_hook;
-		void cmd_lui_notify_server_stub(game::mp::gentity_s* ent)
+		void cmd_lui_notify_server_stub(game::gentity_s* ent)
 		{
-			const auto svs_clients = *game::mp::svs_clients;
+			const auto svs_clients = *game::svs_clients;
 			if (svs_clients == nullptr)
 			{
 				return;
@@ -170,7 +245,7 @@ namespace patches
 			const auto client = &svs_clients[ent->s.number];
 
 			// 13 => change class
-			if (menu_id == 13 && ent->client->team == game::mp::TEAM_SPECTATOR)
+			if (menu_id == 13 && ent->client->team == game::TEAM_SPECTATOR)
 			{
 				return;
 			}
@@ -185,7 +260,7 @@ namespace patches
 			cmd_lui_notify_server_hook.invoke<void>(ent);
 		}
 
-		void sv_execute_client_message_stub(game::mp::client_t* client, game::msg_t* msg)
+		void sv_execute_client_message_stub(game::client_t* client, game::msg_t* msg)
 		{
 			if ((client->reliableSequence - client->reliableAcknowledge) < 0)
 			{
@@ -239,21 +314,21 @@ namespace patches
 			}
 		}
 
+#define GET_FORMATTED_BUFFER() \
+		char buffer[2048]; \
+		{ \
+			va_list ap; \
+			va_start(ap, fmt); \
+			vsnprintf_s(buffer, sizeof(buffer), _TRUNCATE, fmt, ap); \
+			va_end(ap); \
+		}
+
 		void create_2d_texture_stub_1(const char* fmt, ...)
 		{
 			fmt = "Create2DTexture( %s, %i, %i, %i, %i ) failed\n\n"
 				"Disable shader caching, lower graphic settings, free up RAM, or update your GPU drivers.";
 
-			char buffer[2048];
-
-			{
-				va_list ap;
-				va_start(ap, fmt);
-
-				vsnprintf_s(buffer, sizeof(buffer), _TRUNCATE, fmt, ap);
-
-				va_end(ap);
-			}
+			GET_FORMATTED_BUFFER()
 
 			game::Sys_Error("%s", buffer);
 		}
@@ -263,16 +338,7 @@ namespace patches
 			fmt = "Create2DTexture( %s, %i, %i, %i, %i ) failed\n\n"
 				"Disable shader caching, lower graphic settings, free up RAM, or update your GPU drivers.";
 
-			char buffer[2048];
-
-			{
-				va_list ap;
-				va_start(ap, fmt);
-
-				vsnprintf_s(buffer, sizeof(buffer), _TRUNCATE, fmt, ap);
-
-				va_end(ap);
-			}
+			GET_FORMATTED_BUFFER()
 
 			game::Com_Error(code, "%s", buffer);
 		}
@@ -282,16 +348,7 @@ namespace patches
 			fmt = "IDXGISwapChain::Present failed: %s\n\n"
 				"Disable shader caching, lower graphic settings, free up RAM, or update your GPU drivers.";
 
-			char buffer[2048];
-
-			{
-				va_list ap;
-				va_start(ap, fmt);
-
-				vsnprintf_s(buffer, sizeof(buffer), _TRUNCATE, fmt, ap);
-
-				va_end(ap);
-			}
+			GET_FORMATTED_BUFFER()
 
 			game::Com_Error(code, "%s", buffer);
 		}
@@ -322,42 +379,92 @@ namespace patches
 			}
 		}
 
-		utils::hook::detour sv_shutdown_hook;
-		void sv_shutdown_stub(const char* finalmsg)
+		game::dvar_t* r_warn_once_per_frame = nullptr;
+		void warn_once_per_frame_stub(__int64 a1, int a2, int a3, __int64 a4)
 		{
-			console::info("----- Server Shutdown -----\n");
-			sv_shutdown_hook.invoke<void>(finalmsg);
+#ifdef DEBUG
+			if (r_warn_once_per_frame && r_warn_once_per_frame->current.enabled)
+			{
+				utils::hook::invoke<void>(0x5AF170_b, a1, a2, a3, a4);
+			}
+#endif
 		}
 
-		utils::hook::detour com_quit_f_hook;
-		void com_quit_f_stub()
+		template<size_t N>
+		bool try_load_all_zones(std::array<std::string, N> zones)
 		{
-			console::info("quitting...\n");
-			com_quit_f_hook.invoke<void>();
-		}
+			auto* info = utils::memory::get_allocator()->allocate_array<game::XZoneInfo>(zones.size());
+			const auto _ = gsl::finally([&]() 
+			{
+				utils::memory::get_allocator()->free(info);
+			});
+			
+			int counter = 0;
+			for (auto& zone : zones)
+			{
+				if (fastfiles::exists(zone))
+				{
+					info[counter].name = zone.data();
+					info[counter].allocFlags = game::DB_ZONE_COMMON | game::DB_ZONE_CUSTOM;
+					info[counter].freeFlags = 0;
+					counter++;
+				}
+				else
+				{
+					console::error("Couldn't find zone %s\n", zone.data());
+				}
+			}
 
-		utils::hook::detour sub_12C5B0_hook;
-		__int64 sub_12C5B0()
+			if (counter <= 0)
+				return false;
+
+			game::DB_LoadXAssets(info, counter, game::DBSyncMode::DB_LOAD_ASYNC_NO_SYNC_THREADS);
+			return true;
+		}
+		
+		void* ui_init_stub()
 		{
-			return sub_12C5B0_hook.invoke<__int64>() * 0x10;
+			std::array<std::string, 7> zones
+			{
+				"hmw_killstreak",
+				"hmw_attachments",
+				"hmw_ar1",
+				"hmw_smg",
+				"hmw_shotgun",
+				"hmw_launcher",
+				"hmw_rangers"
+			};
+
+			try_load_all_zones(zones);
+
+			return utils::hook::invoke<void*>(0x2A5540_b);
 		}
 	}
 
 	class component final : public component_interface
 	{
 	public:
+		void post_start() override
+		{
+			// replace virtualLobbyMap dvar with trainer
+			if (utils::io::file_exists("zone/trainer.ff") || utils::io::file_exists("trainer.ff"))
+			{
+				dvars::override::register_string("virtualLobbyMap", "trainer", game::DVAR_FLAG_READ);
+			}
+		}
+
 		void post_unpack() override
 		{
 			// Register dvars
-			com_register_dvars_hook.create(SELECT_VALUE(0x385BE0_b, 0x15BB60_b), &com_register_dvars_stub);
+			com_register_dvars_hook.create(0x15BB60_b, &com_register_dvars_stub);
 
 			// Unlock fps in main menu
-			utils::hook::set<BYTE>(SELECT_VALUE(0x1B1EAB_b, 0x34396B_b), 0xEB);
+			utils::hook::set<BYTE>(0x34396B_b, 0xEB);
 
 			if (!game::environment::is_dedi())
 			{
 				// Fix mouse lag
-				utils::hook::nop(SELECT_VALUE(0x4631F9_b, 0x5BFF89_b), 6);
+				utils::hook::nop(0x5BFF89_b, 6);
 				scheduler::loop([]()
 				{
 					SetThreadExecutionState(ES_DISPLAY_REQUIRED);
@@ -391,20 +498,22 @@ namespace patches
 			// Fix speaker config bug
 			dvars::override::register_int("snd_detectedSpeakerConfig", 0, 0, 100, 0);
 
-			// Allow kbam input when gamepad is enabled
-			utils::hook::nop(SELECT_VALUE(0x1AC0CE_b, 0x135EFB_b), 2);
-			utils::hook::nop(SELECT_VALUE(0x1A9DDC_b, 0x13388F_b), 6);
+#ifdef DEBUG
+			// Allow kbam input when gamepad is enabled (dev only)
+			utils::hook::nop(0x135EFB_b, 2);
+			utils::hook::nop(0x13388F_b, 6);
+#endif
 
 			// Show missing fastfiles
-			utils::hook::call(SELECT_VALUE(0x1F588B_b, 0x39A78E_b), missing_content_error_stub);
+			utils::hook::call(0x39A78E_b, missing_content_error_stub);
 
-			// Allow loading of rawfiles from disk
-			db_read_raw_file_hook.create(game::DB_ReadRawFile, db_read_raw_file_stub);
+			// Allow executing custom cfg files with the "exec" command
+			utils::hook::call(0x156D41_b, db_read_raw_file_stub);
 
 			// Remove useless information from errors + add additional help to common errors
-			utils::hook::call(SELECT_VALUE(0x55E919_b, 0x681A69_b), create_2d_texture_stub_1); 	// Sys_Error for "Create2DTexture( %s, %i, %i, %i, %i ) failed"
-			utils::hook::call(SELECT_VALUE(0x55EACB_b, 0x681C1B_b), create_2d_texture_stub_2); 	// Com_Error for ^
-			utils::hook::call(SELECT_VALUE(0x5B35BA_b, 0x6CB1BC_b), swap_chain_stub); 			// Com_Error for "IDXGISwapChain::Present failed: %s"
+			utils::hook::call(0x681A69_b, create_2d_texture_stub_1); 	// Sys_Error for "Create2DTexture( %s, %i, %i, %i, %i ) failed"
+			utils::hook::call(0x681C1B_b, create_2d_texture_stub_2); 	// Com_Error for ^
+			utils::hook::call(0x6CB1BC_b, swap_chain_stub); 			// Com_Error for "IDXGISwapChain::Present failed: %s"
 
 			// Uncheat protect gamepad-related dvars
 			dvars::override::register_float("gpad_button_deadzone", 0.13f, 0, 1, game::DVAR_FLAG_SAVED);
@@ -413,10 +522,13 @@ namespace patches
 			dvars::override::register_float("gpad_stick_pressed", 0.4f, 0, 1, game::DVAR_FLAG_SAVED);
 			dvars::override::register_float("gpad_stick_pressed_hysteresis", 0.1f, 0, 1, game::DVAR_FLAG_SAVED);
 
-			if (!game::environment::is_sp())
-			{
-				patch_mp();
-			}
+			// Disable r_preloadShaders
+			dvars::override::register_bool("r_preloadShaders", false, game::DVAR_FLAG_READ);
+
+			// Disable r_preloadShadersFrontendAllow
+			dvars::override::register_bool("r_preloadShadersFrontendAllow", false, game::DVAR_FLAG_READ);
+
+			patch_mp();
 		}
 
 		static void patch_mp()
@@ -444,8 +556,10 @@ namespace patches
 			// patch "Couldn't find the bsp for this map." error to not be fatal in mp
 			utils::hook::call(0x39465B_b, bsp_sys_error_stub);
 
+#ifdef DEBUG
 			// isProfanity
 			utils::hook::set(0x361AA0_b, 0xC3C033);
+#endif
 
 			// disable elite_clan
 			dvars::override::register_int("elite_clan_active", 0, 0, 0, game::DVAR_FLAG_NONE);
@@ -477,13 +591,15 @@ namespace patches
 			// some [data validation] anti tamper thing that kills performance
 			dvars::override::register_int("dvl", 0, 0, 0, game::DVAR_FLAG_READ);
 
-			// unlock safeArea_*
+			// unlock safeArea_* (h2m-mod values)
 			utils::hook::jump(0x347BC5_b, 0x347BD3_b);
 			utils::hook::jump(0x347BEC_b, 0x347C17_b);
-			dvars::override::register_float("safeArea_adjusted_horizontal", 1, 0, 1, game::DVAR_FLAG_SAVED);
-			dvars::override::register_float("safeArea_adjusted_vertical", 1, 0, 1, game::DVAR_FLAG_SAVED);
-			dvars::override::register_float("safeArea_horizontal", 1, 0, 1, game::DVAR_FLAG_SAVED);
-			dvars::override::register_float("safeArea_vertical", 1, 0, 1, game::DVAR_FLAG_SAVED);
+
+			const auto safe_area_value = 0.97f;
+			dvars::override::register_float("safeArea_adjusted_horizontal", safe_area_value, 0.0f, 1.0f, game::DVAR_FLAG_SAVED);
+			dvars::override::register_float("safeArea_adjusted_vertical", safe_area_value, 0.0f, 1.0f, game::DVAR_FLAG_SAVED);
+			//dvars::override::register_float("safeArea_horizontal", safe_area_value, 0.0f, 1.0f, game::DVAR_FLAG_SAVED);
+			//dvars::override::register_float("safeArea_vertical", safe_area_value, 0.0f, 1.0f, game::DVAR_FLAG_SAVED);
 
 			// allow servers to check for new packages more often
 			dvars::override::register_int("sv_network_fps", 1000, 20, 1000, game::DVAR_FLAG_SAVED);
@@ -506,7 +622,7 @@ namespace patches
 			utils::hook::call(0x1CBD06_b, sv_execute_client_message_stub);
 
 			// Change default hostname and make it replicated
-			dvars::override::register_string("sv_hostname", "^2H1-Mod^7 Default Server", game::DVAR_FLAG_REPLICATED);
+			dvars::override::register_string("sv_hostname", "^5HorizonMW^7 Default Server", game::DVAR_FLAG_REPLICATED);
 
 			// Dont free server/client memory on asset loading (fixes crashing on map rotation)
 			utils::hook::nop(0x132474_b, 5);
@@ -515,21 +631,94 @@ namespace patches
 			cl_gamepad_scrolling_buttons_hook.create(0x133210_b, cl_gamepad_scrolling_buttons_stub);
 
 			// Prevent the game from modifying Windows microphone volume (since voice chat isn't used)
-			utils::hook::set<uint8_t>(0x5BEEA0_b, 0xC3); // Mixer_SetWaveInRecordLevels
-
-			utils::hook::set<uint8_t>(0x556250_b, 0xC3); // disable host migration
+			//utils::hook::set<uint8_t>(0x5BEEA0_b, 0xC3); // Mixer_SetWaveInRecordLevels
 
 			// Fix 'out of memory' error
 			utils::hook::call(0x15C7EE_b, sub_157FA0_stub);
 
-			// Re-implement dev prints
-			com_quit_f_hook.create(0x17CD00_b, com_quit_f_stub);
-			sv_shutdown_hook.create(0x5543A0_b, sv_shutdown_stub);
+			utils::hook::set<uint8_t>(0x556250_b, 0xC3); // disable host migration
 
-			// Allow using unauthorized clantags
-			utils::hook::set<uint32_t>(0x1D9800_b, 0x90C301B0);
+			/*
+			
+				HMW-Mod patches below here
+			
+			*/
+			// change names of window name + stat files for hmw
+			utils::hook::copy_string(0x926210_b, "HorizonMW");	// window name
+			utils::hook::copy_string(0x929168_b, "HorizonMW");	// mulitbyte string (window too?)
+			utils::hook::copy_string(0x91F464_b, "h2mdta");		// mpdata
+			utils::hook::copy_string(0x91F458_b, "h2mcdta");	// commondata
 
-			sub_12C5B0_hook.create(0x12C5B0_b, sub_12C5B0);
+			// overrides of lighting dvars to make it script-controlled instead (and replicated to server -> client)
+			dvars::override::register_bool("r_drawsun", 0, game::DVAR_FLAG_NONE | game::DVAR_FLAG_REPLICATED);
+			dvars::override::register_bool("r_colorscaleusetweaks", 0, game::DVAR_FLAG_NONE | game::DVAR_FLAG_REPLICATED);
+			dvars::override::register_bool("r_primarylightusetweaks", 0, game::DVAR_FLAG_NONE | game::DVAR_FLAG_REPLICATED);
+			dvars::override::register_bool("r_veilusetweaks", 0, game::DVAR_FLAG_NONE | game::DVAR_FLAG_REPLICATED);
+			dvars::override::register_bool("r_viewmodelprimarylightusetweaks", 0, game::DVAR_FLAG_NONE | game::DVAR_FLAG_REPLICATED);
+			dvars::override::register_float("r_diffusecolorscale", 0.0f, 0.0f, 10.0f, game::DVAR_FLAG_NONE | game::DVAR_FLAG_REPLICATED);
+			dvars::override::register_float("r_specularcolorscale", 0.0f, 0.0f, 25.0f, game::DVAR_FLAG_NONE | game::DVAR_FLAG_REPLICATED);
+			dvars::override::register_float("r_primarylighttweakdiffusestrength", 0.0f, 0.0f, 100.0f, game::DVAR_FLAG_NONE | game::DVAR_FLAG_REPLICATED);
+			dvars::override::register_float("r_primarylighttweakspecularstrength", 0.0f, 0.0f, 100.0f, game::DVAR_FLAG_NONE | game::DVAR_FLAG_REPLICATED);
+			dvars::override::register_float("r_viewmodelprimarylighttweakdiffusestrength", 0.0f, 0.0f, 10.0f, game::DVAR_FLAG_NONE | game::DVAR_FLAG_REPLICATED);
+			dvars::override::register_float("r_viewmodelprimarylighttweakdspecularstrength", 0.0f, 0.0f, 10.0f, game::DVAR_FLAG_NONE | game::DVAR_FLAG_REPLICATED);
+			dvars::override::register_int("r_smodelinstancedthreshold", 2, 0, 128, game::DVAR_FLAG_NONE | game::DVAR_FLAG_REPLICATED);
+			dvars::override::register_float("r_viewModelPrimaryLightTweakSpecularStrength", 1.0f, 0.0f, 10.0f, game::DVAR_FLAG_NONE | game::DVAR_FLAG_REPLICATED);
+			dvars::override::register_bool("r_veil", 0, game::DVAR_FLAG_NONE | game::DVAR_FLAG_REPLICATED);
+			dvars::override::register_float("r_veilStrength", 0.086999997f, -10.0f, 10.0f, game::DVAR_FLAG_NONE | game::DVAR_FLAG_REPLICATED);
+			dvars::override::register_float("r_veilBackgroundStrength", 0.91299999f, -10.0f, 10.0f, game::DVAR_FLAG_NONE | game::DVAR_FLAG_REPLICATED);
+
+			utils::hook::set<byte>(0x67D187_b, 0x8);
+			dvars::override::register_bool("r_fog", 1, game::DVAR_FLAG_NONE | game::DVAR_FLAG_REPLICATED);
+			dvars::override::register_float("r_lodBiasRigid", 0.0f, -2000.0f, 0.0f, game::DVAR_FLAG_NONE | game::DVAR_FLAG_REPLICATED);
+			dvars::override::register_float("r_lodBiasSkinned", 0.0f, -2000.0f, 0.0f, game::DVAR_FLAG_NONE | game::DVAR_FLAG_REPLICATED);
+
+			dvars::override::register_int("legacySpawningEnabled", 0, 0, 0, game::DVAR_FLAG_READ);
+
+			// stop spam in console
+			utils::hook::call(0x6BBB81_b, warn_once_per_frame_stub);
+#ifdef DEBUG
+			r_warn_once_per_frame = dvars::register_bool("r_warnOncePerFrame", false, game::DVAR_FLAG_SAVED, "Print warnings from R_WarnOncePerFrame");
+#endif
+
+			// stop even more spam
+			utils::hook::nop(0x26D99F_b, 5);
+
+			// change startup loading animation
+			utils::hook::copy_string(0x8E31D8_b, "h2_loading_animation");
+
+			utils::hook::set<byte>(0xC393F_b, 11); // allow setting cac in game
+
+			utils::hook::call(0x15CDB2_b, ui_init_stub);
+
+			// use default font for overhead names
+			dvars::override::register_int("cg_overheadNamesFont", 6, 0, 6, game::DVAR_FLAG_CHEAT);
+			dvars::override::register_float("cg_overheadNamesSize", 0.5f, 0.0f, 100.0f, game::DVAR_FLAG_CHEAT);
+
+			utils::hook::set<float>(0x8FBA04_b, 350.0f); // move server loading text up to 350.0f instead of 439.0f
+
+			utils::hook::set<byte>(0x53C9FA_b, 0xEB);
+
+			// stop dynents sound spam (its not even used at all in IW4, so who cares)
+			dvars::override::register_bool("dynent_active", false, game::DVAR_FLAG_READ);
+			dvars::override::register_float("dynEnt_playerWakeUpRadius", 0.0f, 0.0f, 0.0f, game::DVAR_FLAG_READ);
+
+			utils::hook::set<byte>(0xF8339_b, 4); // render 4 chars for overheadname rank
+
+			// unprotect draw2D and drawGun
+			dvars::override::register_bool("cg_draw2D", true, game::DVAR_FLAG_NONE);
+			dvars::override::register_bool("cg_drawGun", true, game::DVAR_FLAG_NONE);
+
+			dvars::register_int("scr_war_score_kill", 100, 1, 500, game::DVAR_FLAG_NONE, "Team Deathmatch XP Cap");
+			dvars::register_int("scr_dm_score_kill", 50, 1, 500, game::DVAR_FLAG_NONE, "Free-For-All XP Cap");
+			dvars::register_int("scr_dom_score_kill", 100, 1, 500, game::DVAR_FLAG_NONE, "Domination XP Cap");
+			dvars::register_int("scr_sd_score_kill", 500, 1, 500, game::DVAR_FLAG_NONE, "Search and Destroy XP Cap");
+			dvars::register_int("scr_ctf_score_kill", 100, 1, 500, game::DVAR_FLAG_NONE, "Capture the Flag XP Cap");
+			dvars::register_int("scr_gun_score_kill", 100, 1, 500, game::DVAR_FLAG_NONE, "Gun Game XP Cap");
+			dvars::register_int("scr_hp_score_kill", 100, 1, 500, game::DVAR_FLAG_NONE, "Hardpoint XP Cap");
+			dvars::register_int("scr_conf_score_kill", 50, 1, 500, game::DVAR_FLAG_NONE, "Kill Confirmed XP Cap");
+			dvars::register_int("scr_dd_score_kill", 100, 1, 500, game::DVAR_FLAG_NONE, "Demolition XP Cap");
+			dvars::register_int("scr_sab_score_kill", 100, 1, 500, game::DVAR_FLAG_NONE, "Sabotage XP Cap");
+			dvars::register_int("scr_koth_score_kill", 100, 1, 500, game::DVAR_FLAG_NONE, "Headquarters XP Cap");
 		}
 	};
 }

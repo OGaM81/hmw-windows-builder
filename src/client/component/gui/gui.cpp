@@ -1,6 +1,6 @@
 #include <std_include.hpp>
 
-#ifdef _DEBUG
+#ifdef DEBUG
 #include "loader/component_loader.hpp"
 
 #include "game/game.hpp"
@@ -19,9 +19,6 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 namespace gui
 {
 	std::unordered_map<std::string, bool> enabled_menus;
-
-	ID3D11Device* device;
-	ID3D11DeviceContext* device_context;
 
 	namespace
 	{
@@ -51,6 +48,8 @@ namespace gui
 		utils::concurrency::container<std::vector<event>> event_queue;
 		std::vector<menu_t> menus;
 
+		ID3D11Device* device;
+		ID3D11DeviceContext* device_context;
 		bool initialized = false;
 		bool toggled = false;
 
@@ -59,7 +58,7 @@ namespace gui
 			ImGui::CreateContext();
 			ImGui::StyleColorsDark();
 
-			ImGui_ImplWin32_Init(*reinterpret_cast<HWND*>(0xC9DD2E0_b));
+			ImGui_ImplWin32_Init(*game::hWnd);
 			ImGui_ImplDX11_Init(device, device_context);
 
 			initialized = true;
@@ -138,6 +137,16 @@ namespace gui
 		void new_gui_frame()
 		{
 			ImGui::GetIO().MouseDrawCursor = toggled;
+			if (toggled)
+			{
+				*reinterpret_cast<int*>(0xC9DC405_b) = 0;
+				*game::keyCatchers |= 0x10;
+			}
+			else
+			{
+				*reinterpret_cast<int*>(0xC9DC405_b) = 1;
+				*game::keyCatchers &= ~0x10;
+			}
 
 			update_colors();
 
@@ -262,47 +271,61 @@ namespace gui
 			}
 		}
 
+		void shutdown_gui()
+		{
+			if (initialized)
+			{
+				ImGui_ImplWin32_Shutdown();
+				ImGui::DestroyContext();
+			}
+
+			initialized = false;
+		}
+
+		HRESULT d3d11_create_device_stub(IDXGIAdapter* pAdapter, D3D_DRIVER_TYPE DriverType, HMODULE Software,
+			UINT Flags, const D3D_FEATURE_LEVEL* pFeatureLevels, UINT FeatureLevels, UINT SDKVersion,
+			ID3D11Device** ppDevice, D3D_FEATURE_LEVEL* pFeatureLevel, ID3D11DeviceContext** ppImmediateContext)
+		{
+			shutdown_gui();
+
+			const auto result = D3D11CreateDevice(pAdapter, DriverType, Software, Flags, pFeatureLevels,
+				FeatureLevels, SDKVersion, ppDevice, pFeatureLevel, ppImmediateContext);
+
+			if (ppDevice != nullptr && ppImmediateContext != nullptr)
+			{
+				device = *ppDevice;
+				device_context = *ppImmediateContext;
+			}
+
+			return result;
+		}
+
 		utils::hook::detour wnd_proc_hook;
 		LRESULT wnd_proc_stub(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		{
 			if (wParam != VK_ESCAPE && toggled)
 			{
 				event_queue.access([hWnd, msg, wParam, lParam](std::vector<event>& queue)
-				{
-					queue.emplace_back(hWnd, msg, wParam, lParam);
-				});
+					{
+						queue.emplace_back(hWnd, msg, wParam, lParam);
+					});
 			}
 
 			return wnd_proc_hook.invoke<LRESULT>(hWnd, msg, wParam, lParam);
 		}
 	}
 
-	void toggle()
-	{
-		if (!toggled)
-		{
-			*reinterpret_cast<int*>(0xC9DC405_b) = 0;
-			*game::keyCatchers |= 0x10;
-		}
-		else
-		{
-			*reinterpret_cast<int*>(0xC9DC405_b) = 1;
-			*game::keyCatchers &= ~0x10;
-		}
-		toggled = !toggled;
-	}
-
 	bool gui_key_event(const int local_client_num, const int key, const int down)
 	{
 		if (key == game::K_F11 && down)
 		{
-			toggle();
+			toggled = !toggled;
 			return false;
 		}
 
 		if (key == game::K_ESCAPE && down && toggled)
 		{
-			toggle();
+			toggled = false;
 			return false;
 		}
 
@@ -322,9 +345,9 @@ namespace gui
 	void on_frame(const std::function<void()>& callback, bool always)
 	{
 		on_frame_callbacks.access([always, callback](std::vector<frame_callback>& callbacks)
-		{
-			callbacks.emplace_back(callback, always);
-		});
+			{
+				callbacks.emplace_back(callback, always);
+			});
 	}
 
 	bool is_menu_open(const std::string& name)
@@ -341,9 +364,9 @@ namespace gui
 		notification.creation_time = std::chrono::high_resolution_clock::now();
 
 		notifications.access([notification](std::deque<notification_t>& notifications_)
-		{
-			notifications_.push_front(notification);
-		});
+			{
+				notifications_.push_front(notification);
+			});
 	}
 
 	void copy_to_clipboard(const std::string& text)
@@ -359,12 +382,12 @@ namespace gui
 		enabled_menus[name] = false;
 
 		on_frame([=]
-		{
-			if (enabled_menus.at(name))
 			{
-				callback();
-			}
-		}, always);
+				if (enabled_menus.at(name))
+				{
+					callback();
+				}
+			}, always);
 	}
 
 	void register_callback(const std::function<void()>& callback, bool always)
@@ -375,35 +398,22 @@ namespace gui
 		}, always);
 	}
 
-	bool InputU8(const char* label, unsigned char* v, int step, int step_fast, ImGuiInputTextFlags flags)
-	{
-		// Hexadecimal input provided as a convenience but the flag name is awkward. Typically you'd use InputText() to parse your own data, if you want to handle prefixes.
-		const char* format = (flags & ImGuiInputTextFlags_CharsHexadecimal) ? "%08X" : "%d";
-		return ImGui::InputScalar(label, ImGuiDataType_U8, (void*)v, (void*)(step > 0 ? &step : NULL), (void*)(step_fast > 0 ? &step_fast : NULL), format, flags);
-	}
-
-	bool InputUInt6(const char* label, unsigned int v[6], ImGuiInputTextFlags flags)
-	{
-		return ImGui::InputScalarN(label, ImGuiDataType_U32, v, 6, NULL, NULL, "%d", flags);
-	}
-
-	void shutdown_gui()
-	{
-		if (initialized)
-		{
-			ImGui_ImplWin32_Shutdown();
-			ImGui::DestroyContext();
-		}
-
-		initialized = false;
-	}
-
 	class component final : public component_interface
 	{
 	public:
+		void* load_import(const std::string& library, const std::string& function) override
+		{
+			if (function == "D3D11CreateDevice" && !game::environment::is_dedi())
+			{
+				return d3d11_create_device_stub;
+			}
+
+			return nullptr;
+		}
+
 		void post_unpack() override
 		{
-			if (game::environment::is_dedi() || game::environment::is_sp())
+			if (game::environment::is_dedi())
 			{
 				return;
 			}
@@ -421,7 +431,7 @@ namespace gui
 
 		void pre_destroy() override
 		{
-			if (game::environment::is_dedi() || game::environment::is_sp())
+			if (game::environment::is_dedi())
 			{
 				return;
 			}

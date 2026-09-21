@@ -15,11 +15,9 @@
 #include "fps.hpp"
 #include "server_list.hpp"
 #include "filesystem.hpp"
-#include "mods.hpp"
+#include "motd.hpp"
 #include "fastfiles.hpp"
 #include "scripting.hpp"
-#include "updater.hpp"
-#include "server_list.hpp"
 #include "party.hpp"
 
 #include "game/ui_scripting/execution.hpp"
@@ -35,6 +33,13 @@
 #include "steam/steam.hpp"
 
 #include <discord_rpc.h>
+#include "stats.hpp"
+#include "voice/voice_chat_globals.hpp"
+
+#include <chrono>
+#include <iomanip>
+#include <sstream>
+#include <tcp/hmw_tcp_utils.hpp>
 
 namespace ui_scripting
 {
@@ -49,14 +54,13 @@ namespace ui_scripting
 		utils::hook::detour hks_load_hook;
 
 		const auto lui_common = utils::nt::load_resource(LUI_COMMON);
-		const auto lui_updater = utils::nt::load_resource(LUI_UPDATER);
-		const auto lua_json = utils::nt::load_resource(LUA_JSON);
 
 		struct globals_t
 		{
 			std::string in_require_script;
 			std::unordered_map<std::string, std::string> loaded_scripts;
 			bool load_raw_script{};
+			bool is_raw_in_zone{};
 			std::string raw_script_name{};
 		};
 
@@ -75,14 +79,16 @@ namespace ui_scripting
 
 		void print_error(const std::string& error)
 		{
+#ifdef DEBUG
 			console::error("************** LUI script execution error **************\n");
 			console::error("%s\n", error.data());
 			console::error("********************************************************\n");
+#endif
 		}
 
-		void print_loading_script(const std::string& name)
+		[[maybe_unused]] void print_loading_script(const std::string& name)
 		{
-			console::info("Loading LUI script '%s'\n", name.data());
+			console::debug("Loading LUI script '%s'\n", name.data());
 		}
 
 		std::string get_current_script()
@@ -109,7 +115,7 @@ namespace ui_scripting
 		}
 
 		void load_script(const std::string& name, const std::string& data)
-		{
+		{			
 			globals.loaded_scripts[name] = name;
 
 			const auto lua = get_globals();
@@ -129,92 +135,24 @@ namespace ui_scripting
 			}
 		}
 
-		std::unordered_set<std::string> list_scripts(const std::string& script_dir, bool use_rawfiles)
+		void load_scripts(const std::string& script_dir)
 		{
-			std::unordered_set<std::string> list;
-
-			if (use_rawfiles)
+			if (!utils::io::directory_exists(script_dir))
 			{
-				fastfiles::enum_assets(game::ASSET_TYPE_RAWFILE, [&](const game::XAssetHeader header)
-				{
-					std::string name = header.rawfile->name;
-					if (name.starts_with(script_dir) && name.ends_with("/__init__.lua"))
-					{
-						const auto idx = name.find("/__init__.lua");
-						const auto script = name.substr(0, idx);
-						list.insert(script);
-					}
-				}, true);
-			}
-			else
-			{
-				if (utils::io::directory_exists(script_dir))
-				{
-					const auto scripts = utils::io::list_files(script_dir);
-					for (const auto& script : scripts)
-					{
-						if (std::filesystem::is_directory(script) && utils::io::file_exists(script + "/__init__.lua"))
-						{
-							list.insert(script);
-						}
-					}
-				}
+				return;
 			}
 
-			return list;
-		}
-
-		bool script_exists(const std::string& script, bool use_fs)
-		{
-			return (use_fs ? filesystem::exists(script) : utils::io::file_exists(script)) || game::DB_XAssetExists(game::ASSET_TYPE_RAWFILE, script.data());
-		}
-
-		bool read_script(const std::string& script, std::string* data, bool use_fs)
-		{
-			if (use_fs)
-			{
-				if (filesystem::read_file(script, data))
-				{
-					return true;
-				}
-			}
-			else
-			{
-				if (utils::io::read_file(script, data))
-				{
-					return true;
-				}
-			}
-
-			if (game::DB_XAssetExists(game::ASSET_TYPE_RAWFILE, script.data()))
-			{
-				const auto asset = game::DB_FindXAssetHeader(game::ASSET_TYPE_RAWFILE, script.data(), 0);
-				const auto len = game::DB_GetRawFileLen(asset.rawfile);
-				data->resize(len);
-				game::DB_GetRawBuffer(asset.rawfile, data->data(), len);
-				data->pop_back();
-				return true;
-			}
-
-			return false;
-		}
-
-		void load_scripts(const std::string& script_dir, bool use_rawfiles = false)
-		{
-			const auto scripts = list_scripts(script_dir, use_rawfiles);
+			const auto scripts = utils::io::list_files(script_dir);
 
 			for (const auto& script : scripts)
 			{
-				const auto init_file = script + "/__init__.lua";
-				std::string data;
-				if (read_script(init_file, &data, false))
+				std::string data{};
+				if (std::filesystem::is_directory(script) && utils::io::read_file(script + "/__init__.lua", &data))
 				{
+#ifdef DEBUG
 					print_loading_script(script);
-					load_script(init_file, data);
-				}
-				else
-				{
-					console::error("Failed to read script '%s'\n", init_file.data());
+#endif
+					load_script(script + "/__init__.lua", data);
 				}
 			}
 		}
@@ -269,6 +207,10 @@ namespace ui_scripting
 		{
 			const auto lua = get_globals();
 
+			lua["io"] = {};
+			lua["os"] = {};
+			lua["debug"] = {};
+
 			using game = table;
 			auto game_type = game();
 			lua["game"] = game_type;
@@ -282,19 +224,14 @@ namespace ui_scripting
 			{
 				game_type["getping"] = [](const game&)
 				{
-					if ((*::game::mp::client_state) == nullptr)
+					if ((*::game::client_state) == nullptr)
 					{
 						return 0;
 					}
 
-					return (*::game::mp::client_state)->ping;
+					return (*::game::client_state)->ping;
 				};
 			}
-
-			game_type["issingleplayer"] = [](const game&)
-			{
-				return ::game::environment::is_sp();
-			};
 
 			game_type["ismultiplayer"] = [](const game&)
 			{
@@ -374,55 +311,46 @@ namespace ui_scripting
 				return std::string(buffer);
 			};
 
-			game_type["getloadedmod"] = [](const game&)
-			{
-				const auto& path = mods::get_mod();
-				return path.value_or("");
+			game_type["getattachmentdisplayname"] = [](const game&, const std::string& name)
+			{				
+				auto attachment = ::game::DB_FindXAssetHeader(::game::XAssetType::ASSET_TYPE_ATTACHMENT, name.data(), 1).attachment;
+
+				if (!attachment) return std::string("");
+
+				return std::string(attachment->szDisplayName);
 			};
 
-			if (::game::environment::is_sp())
+			game_type["getloadedmod"] = [](const game&)
 			{
-				using player = table;
-				auto player_type = player();
-				lua["player"] = player_type;
+				/*
+				const auto& path = mods::get_mod();
+				return path.value_or("");
+				*/
+				return "";
+			};
 
-				player_type["notify"] = [](const player&, const std::string& name, const variadic_args& va)
-				{
-					if (!::game::CL_IsCgameInitialized() || !::game::SV_Loaded())
-					{
-						throw std::runtime_error("Not in game");
-					}
+			game_type["sendStats"] = [](const game&)
+			{
+				stats::send_stats();
+			};
 
-					const auto to_string = get_globals()["tostring"];
-					const auto arguments = get_return_values();
-					std::vector<std::string> args{};
-					for (const auto& value : va)
-					{
-						const auto value_str = to_string(value);
+			game_type["getkillcamweaponinfo"] = [](const game&, const int weapon_id, bool is_alt_weapon)
+			{
+				std::vector<std::string> weapon_info{};
 
-						args.push_back(value_str[0].as<std::string>());
-					}
+				auto weaponHudMaterial = ::game::BG_KillIcon(weapon_id, is_alt_weapon);
 
-					::scheduler::once([name, args]()
-					{
-						try
-						{
-							std::vector<scripting::script_value> arguments{};
+				if (weaponHudMaterial)
+					weapon_info.push_back(weaponHudMaterial->info.name);
+				else
+					weapon_info.push_back("");
 
-							for (const auto& arg : args)
-							{
-								arguments.push_back(arg);
-							}
+				auto weaponHudIsFlipped = ::game::BG_FlipKillIcon(weapon_id, is_alt_weapon);
 
-							const auto player = scripting::call("getentbynum", {0}).as<scripting::entity>();
-							scripting::notify(player, name, arguments);
-						}
-						catch (...)
-						{
-						}
-					}, ::scheduler::pipeline::server);
-				};
-			}
+				weapon_info.push_back(std::to_string(!!weaponHudIsFlipped));
+
+				return weapon_info;
+			};
 
 			game_type["virtuallobbypresentable"] = [](const game&)
 			{
@@ -463,144 +391,104 @@ namespace ui_scripting
 				}
 			};
 
-			static std::unordered_set<std::string> available_languages =
+			game_type["openlink"] = [](const game&, const std::string& name)
 			{
-				"english",
-				"english_safe",
-				"french",
-				"german",
-				"italian",
-				"polish",
-				"portuguese",
-				"russian",
-				"spanish",
-				"simplified_chinese",
-				"traditional_chinese",
-				"japanese_partial",
-				"korean"
-			};
-
-			game_type["setlanguage"] = [](const game&, const std::string& language)
-			{
-				if (available_languages.contains(language))
+				const auto links = motd::get_links();
+				const auto link = links.find(name);
+				if (link == links.end())
 				{
-					utils::io::write_file("players2/default/language", language);
-				}
-			};
-
-			game_type["islanguageavailable"] = [](const game&, const std::string& language)
-			{
-				if (!available_languages.contains(language))
-				{
-					return false;
+					return;
 				}
 
-				return utils::io::directory_exists("zone/" + language);
+				ShellExecuteA(nullptr, "open", link->second.data(), nullptr, nullptr, SW_SHOWNORMAL);
 			};
 
-			game_type["zoneexists"] = [](const game&, const std::string& zone)
+			game_type["islink"] = [](const game&, const std::string& name)
 			{
-				if (fastfiles::exists(zone, false))
-				{
-					return true;
-				}
-
-				return utils::io::file_exists(utils::string::va("usermaps/%s/%s.ff", zone.data(), zone.data()));
+				const auto links = motd::get_links();
+				const auto link = links.find(name);
+				return link != links.end();
 			};
 
-			auto mods_table = table();
-			lua["mods"] = mods_table;
-
-			mods_table["getloaded"] = []() -> script_value
-			{
-				const auto& mod = mods::get_mod();
-				if (mod.has_value())
-				{
-					return mod.value();
+			auto hud_extras = table();
+			lua["hudextras"] = hud_extras;
+			hud_extras["showvoicemessage"] = [](const game&) {
+				if (voice_chat_globals::is_voice_message_shown()) {
+					return;
 				}
 
-				return {};
-			};
-
-			mods_table["getlist"] = mods::get_mod_list;
-			mods_table["getinfo"] = [](const std::string& mod)
-			{
-				table info_table{};
-				const auto info = mods::get_mod_info(mod);
-				const auto has_value = info.has_value();
-				info_table["isvalid"] = has_value;
-
-				if (!has_value)
-				{
-					return info_table;
-				}
-
-				const auto& map = info.value();
-				for (const auto& [key, value] : map.items())
-				{
-					info_table[key] = json_to_lua(value);
-				}
-
-				return info_table;
-			};
-
-			mods_table["load"] = [](const std::string& mod)
-			{
+				notify("showvoicemessage", {});
+				voice_chat_globals::set_voice_message_shown_state(true);
 				scheduler::once([=]()
 				{
-					mods::load(mod);
-				}, scheduler::main);
+					notify("hidevoicemessage", {});
+				}, scheduler::pipeline::main, 5s);
 			};
 
-			mods_table["unload"] = []
-			{
-				scheduler::once([]()
-				{
-					mods::unload();
-				}, scheduler::main);
+			// In lua hudextras:gettime("%H:%M:%S %p") // Example: 02:30:15 PM
+			hud_extras["gettime"] = [](const game&, std::string format) { // Format can be %H:%M:%S %p
+				auto now = std::chrono::system_clock::now();
+				auto time_t_now = std::chrono::system_clock::to_time_t(now);
+
+				std::tm local_time;
+				localtime_s(&local_time, &time_t_now);
+
+				std::ostringstream oss;
+				oss << std::put_time(&local_time, format.c_str());
+
+				return oss.str();
 			};
 
-			auto depot_table = table();
-			lua["customdepot"] = depot_table;
-
-			depot_table["save"] = [](const std::string& data)
-			{
-				// todo
-			};
-
-			depot_table["load"] = []()
-			{
-				// todo
-			};
+			hud_extras["getgameversion"] = hmw_tcp_utils::get_version;
 
 			auto server_list_table = table();
 			lua["serverlist"] = server_list_table;
 
 			server_list_table["getplayercount"] = server_list::get_player_count;
 			server_list_table["getservercount"] = server_list::get_server_count;
+			server_list_table["gettotalpagecount"] = server_list::tcp::get_total_pages;
+			server_list_table["getserverlimitperpage"] = server_list::tcp::get_server_limit_per_page;
+			server_list_table["getcurrentpage"] = server_list::tcp::get_current_page;
+			server_list_table["getnotificationmessage"] = server_list::tcp::get_notification_message;
+			server_list_table["geterrormessage"] = server_list::tcp::get_error_message;
+			server_list_table["geterrorheader"] = server_list::tcp::get_error_header;
+			server_list_table["getpagenumber"] = [](int server_index) {
+				return server_list::tcp::get_page_number(server_index);
+			};
 
-			auto updater_table = table();
-			lua["updater"] = updater_table;
+			server_list_table["loadpage"] = [](const game&, int page_index) {
+				server_list::tcp::load_page(page_index);
+			};
 
-			updater_table["relaunch"] = updater::relaunch;
+			server_list_table["nextpage"] = [](const game&) {
+				server_list::tcp::next_page();
+			};
 
-			updater_table["sethastriedupdate"] = updater::set_has_tried_update;
-			updater_table["gethastriedupdate"] = updater::get_has_tried_update;
-			updater_table["autoupdatesenabled"] = updater::auto_updates_enabled;
+			server_list_table["previouspage"] = [](const game&) {
+				server_list::tcp::previous_page();
+			};
+			server_list_table["addfavourite"] = [](const game&, int index)
+			{
+				server_list::add_favourite(index);
+			};
+			server_list_table["deletefavourite"] = [](const game&, int index)
+			{
+				server_list::delete_favourite(index);
+			};
+			server_list_table["sortservers"] = [](const game&, int sort_type)
+			{
+				server_list::tcp::set_sort_type(sort_type);
+				server_list::tcp::sort_current_page(sort_type);
+			};
 
-			updater_table["startupdatecheck"] = updater::start_update_check;
-			updater_table["isupdatecheckdone"] = updater::is_update_check_done;
-			updater_table["getupdatecheckstatus"] = updater::get_update_check_status;
-			updater_table["isupdateavailable"] = updater::is_update_available;
+			server_list_table["joingame"] = [](const game&, int index)
+			{
+				server_list::tcp::join_server_new(index);
+			};
 
-			updater_table["startupdatedownload"] = updater::start_update_download;
-			updater_table["isupdatedownloaddone"] = updater::is_update_download_done;
-			updater_table["getupdatedownloadstatus"] = updater::get_update_download_status;
-			updater_table["cancelupdate"] = updater::cancel_update;
-			updater_table["isrestartrequired"] = updater::is_restart_required;
-
-			updater_table["getlasterror"] = updater::get_last_error;
-			updater_table["getcurrentfile"] = updater::get_current_file;
+			server_list_table["isgettingserverlist"] = server_list::tcp::is_getting_server_list;
+			server_list_table["isgettingfavourites"] = server_list::tcp::is_getting_favourites;
+			server_list_table["isloadingpage"] = server_list::tcp::is_loading_a_page;
 
 			auto download_table = table();
 			lua["download"] = download_table;
@@ -631,45 +519,27 @@ namespace ui_scripting
 				return lightuserdata(material);
 			};
 
-			lua["string"]["escapelocalization"] = [](const std::string& str)
-			{
-				return "\x1F"s.append(str);
-			};
-
-			lua["string"]["el"] = lua["string"]["escapelocalization"];
-
 			discord_table["reply"] = table();
 			discord_table["reply"]["yes"] = DISCORD_REPLY_YES;
 			discord_table["reply"]["ignore"] = DISCORD_REPLY_IGNORE;
 			discord_table["reply"]["no"] = DISCORD_REPLY_NO;
 
-			auto bits_table = table();
-			lua["bits"] = bits_table;
+			auto motd_table = table();
+			lua["motd"] = motd_table;
 
-			bits_table["lshift"] = [](const int a, const int b)
+			motd_table["getnumfeaturedtabs"] = motd::get_num_featured_tabs;
+
+			motd_table["getmotd"] = []()
 			{
-				return a << b;
+				return json_to_lua(motd::get_motd());
 			};
 
-			bits_table["rshift"] = [](const int a, const int b)
+			motd_table["getfeaturedtab"] = [](const int index)
 			{
-				return a >> b;
+				return json_to_lua(motd::get_featured_tab(index));
 			};
 
-			bits_table["andbits"] = [](const int a, const int b)
-			{
-				return a & b;
-			};
-
-			bits_table["orbits"] = [](const int a, const int b)
-			{
-				return a | b;
-			};
-
-			bits_table["neg"] = [](const int a)
-			{
-				return ~a;
-			};
+			motd_table["hasmotd"] = motd::has_motd;
 		}
 
 		void start()
@@ -705,33 +575,73 @@ namespace ui_scripting
 			lua["luiglobals"] = lua;
 
 			load_script("lui_common", lui_common);
-			load_script("lui_updater", lui_updater);
-			load_script("lua_json", lua_json);
 
-			auto search_paths = filesystem::get_search_paths_rev();
-			search_paths.emplace_back("");
-
-			for (const auto& path : search_paths)
+#ifdef DEBUG
+			for (const auto& path : filesystem::get_search_paths_rev())
 			{
 				load_scripts(path + "/ui_scripts/");
-				if (game::environment::is_sp())
-				{
-					load_scripts(path + "/ui_scripts/sp/");
-				}
-				else
-				{
-					load_scripts(path + "/ui_scripts/mp/");
-				}
+				load_scripts(path + "/ui_scripts/mp/");
 			}
+#endif // DEBUG
 
-			load_scripts("ui_scripts/", true);
-			if (game::environment::is_sp())
+			std::vector<std::pair<std::string, game::XAssetHeader>> loaded_scripts_queue;
+
+			auto insert_alphabetically = [](std::vector<std::pair<std::string, game::XAssetHeader>>&vec, const std::string & key, const game::XAssetHeader & value)
 			{
-				load_scripts("ui_scripts/sp/", true);
-			}
-			else
+				auto it = std::lower_bound(vec.begin(), vec.end(), key,
+					[](const auto& elem, const auto& val)
+					{ 
+						return elem.first < val; 
+					});
+
+				vec.insert(it, std::make_pair(key, value));
+			};
+
+			// check zones for LUI rawfiles to load
+			fastfiles::enum_assets(game::ASSET_TYPE_RAWFILE, [&](game::XAssetHeader header)
 			{
-				load_scripts("ui_scripts/mp/", true);
+				const auto* rawfile = header.rawfile;
+				if (rawfile)
+				{
+					std::string rawfile_name = rawfile->name;
+					if (!rawfile_name.ends_with("/__init__.lua"))
+					{
+						return;
+					}
+
+					if (rawfile_name.ends_with(".lua"))
+					{
+						const auto base_name = rawfile_name.substr(0, rawfile_name.size() - 4);
+						insert_alphabetically(loaded_scripts_queue, rawfile_name, header);
+					}
+				}
+			}, false);
+
+			for (const auto& entry : loaded_scripts_queue)
+			{
+				const auto* rawfile = entry.second.rawfile;
+				if (!rawfile)
+				{
+					continue;
+				}
+
+				auto rawfile_name = entry.first;
+
+#ifdef DEBUG
+				print_loading_script(rawfile_name);
+#endif
+
+				std::string buffer;
+				const auto len = game::DB_GetRawFileLen(rawfile);
+
+				buffer.resize(len);
+				game::DB_GetRawBuffer(rawfile, buffer.data(), len);
+				if (len > 0)
+				{
+					buffer.pop_back();
+				}
+
+				load_script(rawfile_name, buffer);
 			}
 		}
 
@@ -768,47 +678,30 @@ namespace ui_scripting
 			return hks_package_require_hook.invoke<void*>(state);
 		}
 
-		bool read_lua_as_rawfile(const std::string& name, std::string* data)
-		{
-			if (filesystem::read_file(name, data))
-			{
-				return true;
-			}
-
-			const auto asset = game::DB_FindXAssetHeader(game::ASSET_TYPE_RAWFILE, name.data(), 0);
-			if (asset.rawfile != nullptr)
-			{
-				const auto len = game::DB_GetRawFileLen(asset.rawfile);
-				data->resize(len);
-				game::DB_GetRawBuffer(asset.rawfile, data->data(), len);
-				return true;
-			}
-
-			return false;
-		}
-
 		game::XAssetHeader db_find_x_asset_header_stub(game::XAssetType type, const char* name, int allow_create_default)
 		{
 			game::XAssetHeader header{.luaFile = nullptr};
 
 			if (!is_loaded_script(globals.in_require_script))
 			{
-				header = game::DB_FindXAssetHeader(type, name, allow_create_default);
-				if (header.luaFile == nullptr && script_exists(name, true))
-				{
-					header.luaFile = reinterpret_cast<game::LuaFile*>(1);
-				}
-
-				return header;
+				return game::DB_FindXAssetHeader(type, name, allow_create_default);
 			}
 
 			const auto folder = globals.in_require_script.substr(0, globals.in_require_script.find_last_of("/\\"));
 			const std::string name_ = name;
 			const std::string target_script = folder + "/" + name_ + ".lua";
 
-			if (script_exists(target_script, false))
+			if (utils::io::file_exists(target_script))
 			{
 				globals.load_raw_script = true;
+				globals.raw_script_name = target_script;
+				header.luaFile = reinterpret_cast<game::LuaFile*>(1);
+			}
+			else if (game::DB_XAssetExists(game::ASSET_TYPE_RAWFILE, target_script.data()) &&
+				!game::DB_IsXAssetDefault(game::ASSET_TYPE_RAWFILE, target_script.data()))
+			{
+				globals.load_raw_script = true;
+				globals.is_raw_in_zone = true;
 				globals.raw_script_name = target_script;
 				header.luaFile = reinterpret_cast<game::LuaFile*>(1);
 			}
@@ -826,31 +719,37 @@ namespace ui_scripting
 			if (globals.load_raw_script)
 			{
 				globals.load_raw_script = false;
+
 				globals.loaded_scripts[globals.raw_script_name] = globals.in_require_script;
 
-				std::string data;
-				if (read_script(globals.raw_script_name, &data, false))
+				if (globals.is_raw_in_zone)
 				{
-					return load_buffer(globals.raw_script_name, data);
+					globals.is_raw_in_zone = false;
+
+					const auto rawfile = game::DB_FindXAssetHeader(game::ASSET_TYPE_RAWFILE, globals.raw_script_name.data(), 0).rawfile;
+					if (rawfile)
+					{
+						std::string buffer;
+						const auto len = game::DB_GetRawFileLen(rawfile);
+
+						buffer.resize(len);
+						game::DB_GetRawBuffer(rawfile, buffer.data(), len);
+						if (len > 0)
+						{
+							buffer.pop_back();
+						}
+
+						return load_buffer(globals.raw_script_name, buffer);
+					}
 				}
-
-				return 0;
+				else
+				{
+					return load_buffer(globals.raw_script_name, utils::io::read_file(globals.raw_script_name));
+				}
 			}
 
-			std::string name = chunk_name;
-			name = name.substr(1);
-
-			std::string data;
-			if (read_script(name, &data, true))
-			{
-				console::info("Overriding lua file %s\n", name.data());
-				return load_buffer(chunk_name, data);
-			}
-			else
-			{
-				return hks_load_hook.invoke<int>(state, compiler_options, reader,
-					reader_data, chunk_name);
-			}
+			return hks_load_hook.invoke<int>(state, compiler_options, reader,
+				reader_data, chunk_name);
 		}
 
 		std::string current_error;
@@ -897,11 +796,6 @@ namespace ui_scripting
 
 			return 0;
 		}
-
-		int removed_function_stub(game::hks::lua_State* /*state*/)
-		{
-			return 0;
-		}
 	}
 
 	table get_globals()
@@ -937,47 +831,19 @@ namespace ui_scripting
 
 			dvars::register_bool("r_preloadShadersFrontendAllow", true, game::DVAR_FLAG_SAVED, "Allow shader popup on startup");
 
-			utils::hook::call(SELECT_VALUE(0xE7419_b, 0x25E809_b), db_find_x_asset_header_stub);
-			utils::hook::call(SELECT_VALUE(0xE72CB_b, 0x25E6BB_b), db_find_x_asset_header_stub);
+			utils::hook::call(0x25E809_b, db_find_x_asset_header_stub);
+			utils::hook::call(0x25E6BB_b, db_find_x_asset_header_stub);
 
-			hks_load_hook.create(SELECT_VALUE(0xB46F0_b, 0x22C180_b), hks_load_stub);
+			hks_load_hook.create(0x22C180_b, hks_load_stub);
 
-			hks_package_require_hook.create(SELECT_VALUE(0x90070_b, 0x214040_b), hks_package_require_stub);
-			hks_start_hook.create(SELECT_VALUE(0x103C50_b, 0x27A790_b), hks_start_stub);
-			hks_shutdown_hook.create(SELECT_VALUE(0xFB370_b, 0x2707C0_b), hks_shutdown_stub);
+			hks_package_require_hook.create(0x214040_b, hks_package_require_stub);
+			hks_start_hook.create(0x27A790_b, hks_start_stub);
+			hks_shutdown_hook.create(0x2707C0_b, hks_shutdown_stub);
 
 			command::add("lui_restart", []
 			{
-				utils::hook::invoke<void>(SELECT_VALUE(0x1052C0_b, 0x27BEC0_b));
+				utils::hook::invoke<void>(0x27BEC0_b);
 			});
-
-			// remove unsafe functions
-			utils::hook::nop(0x22B5CA_b, 1);
-			utils::hook::jump(0x26EB60_b, 0x22B450_b);
-
-			utils::hook::jump(0x212CF0_b, removed_function_stub); // io
-			utils::hook::jump(0x213180_b, removed_function_stub); // os
-			utils::hook::jump(0x213EB0_b, removed_function_stub); // serialize
-			utils::hook::jump(0x213E80_b, removed_function_stub); // hks
-			utils::hook::jump(0x2135F0_b, removed_function_stub); // debug
-			utils::hook::nop(0x212C78_b, 5); // coroutine
-
-			// profile
-			utils::hook::jump(0x207F50_b, removed_function_stub);
-			utils::hook::jump(0x207F60_b, removed_function_stub);
-			utils::hook::jump(0x207F70_b, removed_function_stub);
-			utils::hook::jump(0x208030_b, removed_function_stub);
-
-			utils::hook::jump(0x209CC0_b, removed_function_stub);
-			utils::hook::jump(0x209930_b, removed_function_stub);
-			utils::hook::jump(0x20C920_b, removed_function_stub);
-
-			utils::hook::jump(0x214750_b, removed_function_stub);
-			utils::hook::jump(0x2131B0_b, removed_function_stub);
-			utils::hook::jump(0x213EE0_b, removed_function_stub);
-
-			utils::hook::jump(0x208C70_b, removed_function_stub);
-			utils::hook::jump(0x20F620_b, removed_function_stub);
 		}
 	};
 }

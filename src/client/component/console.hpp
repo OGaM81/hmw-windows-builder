@@ -2,10 +2,6 @@
 
 namespace console
 {
-	HWND get_window();
-	void set_title(std::string title);
-	void set_size(int width, int height);
-
 	enum console_type
 	{
 		con_type_error = 1,
@@ -25,7 +21,7 @@ namespace console
 	template <typename... Args>
 	void debug(const char* fmt, Args&&... args)
 	{
-#ifdef _DEBUG
+#ifdef DEBUG
 		print(con_type_debug, fmt, std::forward<Args>(args)...);
 #endif
 	}

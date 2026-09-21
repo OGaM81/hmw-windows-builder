@@ -1,6 +1,6 @@
 #include <std_include.hpp>
 
-#ifdef _DEBUG
+#ifdef DEBUG
 #include "loader/component_loader.hpp"
 
 #include "game/game.hpp"
@@ -24,23 +24,15 @@ namespace gui::asset_list
 		std::string assets_name_filter[game::XAssetType::ASSET_TYPE_COUNT];
 		std::string assets_value_filter[game::XAssetType::ASSET_TYPE_COUNT];
 		std::string zone_name_filter[game::XAssetType::ASSET_TYPE_COUNT];
-		
-		struct asset_button_t
-		{
-			std::string name;
-			std::optional<std::function<bool()>> enabled;
-			std::function<void(const game::XAssetHeader)> callback;
-		};
 
 		std::unordered_map<game::XAssetType, std::function<void(const std::string&)>> asset_view_callbacks;
-		std::vector<asset_button_t> asset_buttons[game::XAssetType::ASSET_TYPE_COUNT];
 
 		bool default_only[game::ASSET_TYPE_COUNT] = {};
 		int asset_count[game::ASSET_TYPE_COUNT] = {};
 		bool disabled_zones[game::ASSET_TYPE_COUNT][0x100] = {};
 		bool show_asset_zone = true;
 
-		void draw_table_row(const game::XAssetType type, const game::XAssetEntry* entry, bool should_add_view_btn)
+		void draw_table_row(game::XAssetType type, const game::XAssetEntry* entry, bool should_add_view_btn)
 		{
 			const auto asset = entry->asset;
 			auto asset_name = game::DB_GetXAssetName(&asset);
@@ -82,32 +74,14 @@ namespace gui::asset_list
 
 			ImGui::TableNextRow();
 
-			if (should_add_view_btn || type == game::ASSET_TYPE_WEAPON)
+			if (should_add_view_btn)
 			{
 				ImGui::TableSetColumnIndex(col_index++);
 				ImGui::PushID(asset_count[type]);
-
-				if (should_add_view_btn)
+				if (ImGui::Button("view"))
 				{
-					if (ImGui::Button("view"))
-					{
-						asset_view_callbacks.at(type)(asset_name);
-					}
+					asset_view_callbacks.at(type)(asset_name);
 				}
-
-				for (const auto& btn : asset_buttons[type])
-				{
-					if (!btn.enabled.has_value() || btn.enabled->operator()())
-					{
-						ImGui::SameLine();
-
-						if (ImGui::Button(btn.name.data()))
-						{
-							btn.callback(entry->asset.header);
-						}
-					}
-				}
-
 				ImGui::PopID();
 			}
 
@@ -116,7 +90,7 @@ namespace gui::asset_list
 				ImGui::TableSetColumnIndex(col_index++);
 				if (entry->zoneIndex > 0)
 				{
-					ImGui::Text(fastfiles::get_zone_name((int)entry->zoneIndex).data());
+					ImGui::Text(fastfiles::get_zone_name((int)entry->zoneIndex));
 				}
 				else
 				{
@@ -146,9 +120,9 @@ namespace gui::asset_list
 		{
 			if (ImGui::TreeNode("loaded zones"))
 			{
-				for (auto i = 1u; i <= *game::mp::g_zoneCount; i++)
+				for (auto i = 1u; i <= *game::g_zoneCount; i++)
 				{
-					if (ImGui::Button(fastfiles::get_zone_name(i).data()))
+					if (ImGui::Button(fastfiles::get_zone_name(i)))
 					{
 						gui::copy_to_clipboard(fastfiles::get_zone_name(i));
 					}
@@ -187,10 +161,10 @@ namespace gui::asset_list
 
 			if (ImGui::InputText("zone name", &zone_name_filter[type]))
 			{
-				for (auto zone = 0u; zone <= *game::mp::g_zoneCount; zone++)
+				for (auto zone = 0u; zone <= *game::g_zoneCount; zone++)
 				{
 					const auto zone_name = fastfiles::get_zone_name(zone);
-					disabled_zones[type][zone] = !utils::string::strstr_lower(zone_name.data(), zone_name_filter[type].data());
+					disabled_zones[type][zone] = !utils::string::strstr_lower(zone_name, zone_name_filter[type].data());
 				}
 			}
 
@@ -220,18 +194,8 @@ namespace gui::asset_list
 
 			ImGui::BeginChild("assets list");
 
-			auto has_buttons = false;
-			for (const auto& btn : asset_buttons[type])
-			{
-				if (!btn.enabled.has_value() || btn.enabled->operator()())
-				{
-					has_buttons = true;
-					break;
-				}
-			}
-
 			auto column_count = 1;
-			column_count += should_add_view_btn || has_buttons;
+			column_count += should_add_view_btn;
 			column_count += show_asset_zone;
 			column_count += type == game::ASSET_TYPE_LOCALIZE_ENTRY;
 
@@ -303,22 +267,12 @@ namespace gui::asset_list
 		asset_view_callbacks.insert(std::make_pair(type, callback));
 	}
 
-	void add_asset_button(game::XAssetType type, const std::string& name, const std::function<void(const game::XAssetHeader)>& callback,
-		const std::optional<std::function<bool()>>& enabled_callback)
-	{
-		asset_button_t button{};
-		button.name = name;
-		button.callback = callback;
-		button.enabled = enabled_callback;
-		asset_buttons[type].emplace_back(button);
-	}
-
 	class component final : public component_interface
 	{
 	public:
 		void post_unpack() override
 		{
-			if (game::environment::is_dedi() || game::environment::is_sp())
+			if (game::environment::is_dedi())
 			{
 				return;
 			}

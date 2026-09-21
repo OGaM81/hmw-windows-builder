@@ -1,23 +1,239 @@
 #include <std_include.hpp>
-
-#ifdef _DEBUG
 #include "loader/component_loader.hpp"
 
+#include "command.hpp"
+#include "console.hpp"
 #include "dvars.hpp"
+#include "filesystem.hpp"
+#include "network.hpp"
 #include "scheduler.hpp"
+
+#include "gsc/script_extension.hpp" 
 
 #include "game/game.hpp"
 #include "game/dvars.hpp"
 
+#include "scripting.hpp"
+
 #include <utils/hook.hpp>
-#include <utils/string.hpp>
+#include "fastfiles.hpp"
+#include "console.hpp"
+#include <utils/io.hpp>
+#include <bitset>
+
+#include <voice/hmw_voice_chat.hpp>
 
 namespace experimental
 {
-	namespace
+	game::dvar_t* sv_open_menu_mapvote = nullptr;
+#ifdef DEBUG
+	game::dvar_t* cg_draw_material = nullptr;
+#endif
+	namespace 
 	{
-		game::dvar_t* cg_draw_material = nullptr;
+		void open_lui_mapvote() 
+		{
+			if (sv_open_menu_mapvote && sv_open_menu_mapvote->current.enabled)
+			{
+				command::execute("lui_open menu_mapvote");
+			}
+		}
 
+		utils::hook::detour bg_customization_get_model_name_hook;
+
+		char* bg_customization_get_model_name_stub(game::CustomizationType type, unsigned short modelIndex)
+		{
+			auto* current_model = bg_customization_get_model_name_hook.invoke<char*>(type, modelIndex);
+
+			const auto* env_mod = game::GameInfo_GetCurrentMapCustom("envmod");
+			if (!env_mod || !*env_mod)
+			{
+				env_mod = "none";
+			}
+
+			const auto costume_model_table = game::DB_FindXAssetHeader(game::ASSET_TYPE_STRINGTABLE, "mp/costumemodeltable.csv", false).stringTable;
+			if (costume_model_table == nullptr)
+			{
+				return current_model;
+			}
+
+			// if the environment isn't none, its most likely a wet environment and can use the wetmodel
+			if (strcmp(env_mod, "none"))
+			{
+				if (type == game::CustomizationType::SHIRT || type == game::CustomizationType::HEAD)
+				{
+					auto wet_model = game::StringTable_Lookup(costume_model_table, 0, current_model, 18);
+					if (wet_model && *wet_model != '\0')
+					{
+						return wet_model;
+					}
+				}
+			}
+
+			return current_model;
+		}
+
+		struct game::WeaponDef* BG_GetWeaponDef(unsigned int weaponIndex)
+		{
+			return *(&game::bg_weaponDefs)[weaponIndex];
+		}
+
+		utils::hook::detour missile_trajectory_controlled_hook;
+		void missile_trajectory_controlled_stub(game::gentity_s* entity, game::vec3_t* result)
+		{
+			entity->clipmask &= 0xFFFFF7FF;
+
+			game::vec3_t dirOrig{};
+			game::AngleVectors(&entity->currentAngles, &dirOrig, nullptr, nullptr);
+
+			auto missile_speed = (dirOrig[0] * entity->trDelta[0]) + (dirOrig[1] * entity->trDelta[1]) + (dirOrig[2] * entity->trDelta[2]);
+
+			auto entity_handle = entity->owner;
+			auto owner_entity = game::g_entities[entity_handle - 1];
+			if (!owner_entity.client)
+			{
+				missile_trajectory_controlled_hook.invoke<void>(entity, result);
+				return;
+			}
+
+			auto is_boosting = ((owner_entity.client->sess.cmd.buttons & 0x1) != 0);
+
+			if (!is_boosting && _bittest((long*)&entity->missile_flags, 9u)) //(entity->missile_flags & 0x200)
+			{
+				missile_speed = 750.0f;
+			}
+			else if (is_boosting && !(entity->missile_flags & 4)) //(entity->missile_flags & 1)
+			{
+				entity->missile_flags |= 0x4; // set the boost flag so this code doesn't run again
+				missile_speed = missile_speed * 2.5f;
+			}
+			else
+			{
+				if ((3000.0f - missile_speed) <= 0.001f)
+				{
+					if (missile_speed < 3000.0f)
+					{
+						missile_speed = fmaxf(3000.0f, missile_speed - 25.0f);
+					}
+				}
+				else
+				{
+					missile_speed = fminf(3000.0f, missile_speed + 100.0f);
+				}
+			}
+
+			entity->trDelta[0] = dirOrig[0] * missile_speed;
+			entity->trDelta[1] = dirOrig[1] * missile_speed;
+			entity->trDelta[2] = dirOrig[2] * missile_speed;
+
+			game::vec3_t base{};
+			game::Trajectory_GetTrBase(&entity->_padding[0x5E], &base);
+
+			(*result)[0] = (entity->trDelta[0] * 0.050000001f) + base[0];
+			(*result)[1] = (entity->trDelta[1] * 0.050000001f) + base[1];
+			(*result)[2] = (entity->trDelta[2] * 0.050000001f) + base[2];
+
+			game::Trajectory_SetTrBase(&entity->_padding[0x5E], result);
+
+			memset(&base, 0, sizeof(base));
+		}
+
+		utils::hook::detour CG_GetFootstepVolumeScale_Detour;
+		//float CG_GetFootstepVolumeScale_Stub(int localClientNum, __int64 cent, __int64 aliasList)
+		//{
+		//	auto perk_footstepVolumeEnemy = game::Dvar_FindVar("perk_footstepVolumeEnemy");
+
+		//	float result;
+		//	if (aliasList == 2 || aliasList == 3 || aliasList == 4 || (result = aliasList - 2, (aliasList - 2) <= 2))
+		//	{		
+		//		result = game::sub_14045E280(cent);
+		//		if (result && (*(DWORD*)(result + 7612) & 0x2000000) != 0)
+		//			result = perk_footstepVolumeEnemy->current.value;
+		//	}
+
+		//	return result;
+
+		//	//return CG_GetFootstepVolumeScale_Detour.invoke<int>(localClientNum, cent, aliasList);
+		//}
+		float __fastcall CG_GetFootstepVolumeScale_Stub(int localClientNum, game::fake_centity_s* cent, __int64 aliasList)
+		{
+			float finalSoundVolume = 1.0;
+			float real_sound_vol = 0;
+			game::fake_entlist* localClient{};
+			game::fake_entlist* otherEnt{};
+
+			auto perk_footstepVolumeEnemy = game::Dvar_FindVar("perk_footstepVolumeEnemy");
+
+			switch (aliasList)
+			{
+			case 2:
+				real_sound_vol = cent->alias1; //*(float*)(cent + 3736);
+			LABEL_9:
+				if (real_sound_vol != 0.0)
+					finalSoundVolume = real_sound_vol;
+				goto LABEL_11;
+			case 3:
+				real_sound_vol = cent->alias2; //*(float*)(cent + 3740);
+				goto LABEL_9;
+			case 4:
+				real_sound_vol = cent->alias3; //*(float*)(cent + 3744);
+				goto LABEL_9;
+			}
+			if ((aliasList - 2) > 2)
+				return 1.0;
+		LABEL_11:
+			localClient = game::sub_14045E280(*&localClientNum);
+			otherEnt = game::sub_14045E280(*&cent->number);
+			if (localClient && (localClient->perk & 0x1000) != 0)
+				finalSoundVolume = finalSoundVolume * 0.0625f;
+			if (otherEnt)
+			{
+				if ((otherEnt->perk & 0x2000000) != 0)
+					finalSoundVolume = finalSoundVolume * (perk_footstepVolumeEnemy->current.value * perk_footstepVolumeEnemy->current.value);
+			}
+
+			console::info("Playing Sound Volume %.f\n", finalSoundVolume);
+			return finalSoundVolume;
+		}
+
+		inline bool has_commando_perk(game::fake_entlist* entity)
+		{
+			/*
+			auto response = utils::hook::invoke<unsigned int>(0x2C6270_b, "specialty_extendmelee");
+			auto has_perk = (entity->perk == response);
+			return has_perk;
+			*/
+			return false;
+		}
+
+		void commando_lunge_stub(utils::hook::assembler& a)
+		{
+			const auto has_commando = a.newLabel();
+			const auto charging_3_jump = a.newLabel();
+
+			a.cmp(dword_ptr(rbx, 0x3B8), 1); // 7
+			a.setz(r12b);		// 4
+			a.xor_(edi, edi);	// 2
+
+			a.pushad64();
+			a.mov(rcx, rbx); // ps
+			a.call_aligned(has_commando_perk);
+			a.test(al, al);
+			a.jnz(has_commando); // Jump if not zero
+			a.popad64();
+
+			a.jmp(0x2DBA60_b); // just do normal code if we dont have commando since we dont cover the 12 bytes after
+
+			a.bind(has_commando);
+			a.popad64();
+			a.test(dword_ptr(rbx, 0x54), 0x10000);
+			a.jnz(charging_3_jump);
+			a.jmp(0x2DBA69_b); // back to game
+
+			a.bind(charging_3_jump);
+			a.jmp(0x2DBAD3_b);
+		}
+#ifdef DEBUG
 		float distance_2d(float* a, float* b)
 		{
 			return sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]));
@@ -45,18 +261,6 @@ namespace experimental
 			v[0] /= length;
 			v[1] /= length;
 			v[2] /= length;
-		}
-
-		// Calculates the normal vector of a triangle defined by three 3D points
-		void calculateTriangleNormal(float p[3][3], float normal[3])
-		{
-			float v1[3], v2[3];
-			for (int i = 0; i < 3; i++) {
-				v1[i] = p[1][i] - p[0][i];
-				v2[i] = p[2][i] - p[0][i];
-			}
-			crossProduct3D(v1, v2, normal);
-			normalize3D(normal);
 		}
 
 		// Calculates the dot product of two 3D vectors
@@ -93,6 +297,18 @@ namespace experimental
 			beta = (dot11 * dot02 - dot01 * dot12) * invDenom;
 			gamma = (dot00 * dot12 - dot01 * dot02) * invDenom;
 			alpha = 1.0f - beta - gamma;
+		}
+
+		// Calculates the normal vector of a triangle defined by three 3D points
+		void calculateTriangleNormal(float p[3][3], float normal[3])
+		{
+			float v1[3], v2[3];
+			for (int i = 0; i < 3; i++) {
+				v1[i] = p[1][i] - p[0][i];
+				v2[i] = p[2][i] - p[0][i];
+			}
+			crossProduct3D(v1, v2, normal);
+			normalize3D(normal);
 		}
 
 		bool lineTriangleIntersection(float p[3][3], float linePoint[3], float lineDir[3])
@@ -143,6 +359,9 @@ namespace experimental
 			}
 		}
 
+		int frames_passed = 0; // 20 then resets to 0
+		std::optional<std::string> current_material;
+
 		void render_draw_material()
 		{
 			static const auto* sv_running = game::Dvar_FindVar("sv_running");
@@ -151,13 +370,13 @@ namespace experimental
 				return;
 			}
 
-			if (!cg_draw_material || !cg_draw_material->current.enabled)
+			static const auto* cg_draw2d = game::Dvar_FindVar("cg_draw2D");
+			if (cg_draw2d && !cg_draw2d->current.enabled)
 			{
 				return;
 			}
 
-			static const auto* cg_draw2d = game::Dvar_FindVar("cg_draw2D");
-			if (cg_draw2d && !cg_draw2d->current.enabled)
+			if (!cg_draw_material || !cg_draw_material->current.integer)
 			{
 				return;
 			}
@@ -186,91 +405,76 @@ namespace experimental
 				return;
 			}
 
+			/*
+			if (frames_passed > 5)
+			{
+				frames_passed = 0;
+				current_material = {};
+			}
+			else
+			{
+				frames_passed = frames_passed + 1;
+			}
+
+			if (current_material.has_value())
+			{
+				game::UI_DrawWrappedText(placement, current_material.value().data(), &rect, font,
+					8.0, 240.0f, 0.2f, text_color, 0, 0, &text_rect, 0);
+				return;
+			}
+			*/
+
 			game::vec3_t origin{};
-			const auto client = game::mp::g_entities[0].client;
+			const auto client = game::g_entities[0].client;
+			const auto angles = client->ps.viewangles;
 			utils::hook::invoke<void>(0x4057F0_b, client, origin); // G_GetPlayerViewOrigin
 
 			game::vec3_t forward{};
-			utils::hook::invoke<void>(0x59C600_b, client->ps.delta_angles, forward, nullptr, nullptr); // AngleVectors
+			utils::hook::invoke<void>(0x59C600_b, angles, forward, nullptr, nullptr); // AngleVectors
 
 			float min_distance = -1.f;
-			float second_min_distance = -1.f;
-			float third_min_distance = -1.f;
-
-			game::vec3_t target_center{}, target_triangle[3]{};
-			game::vec3_t secondary_target_center{}, secondary_target_triangle[3]{};
-			game::vec3_t third_target_center{}, third_target_triangle[3]{};
-
+			game::vec3_t target_center{};
+			game::vec3_t target_triangle[3]{};
 			game::GfxSurface* target_surface = nullptr;
-			game::GfxSurface* secondary_surface = nullptr;
-			game::GfxSurface* third_surface = nullptr;
 
-			for (auto i = 0u; i < gfx_map->surfaceCount; i++) 
+			for (auto i = 0u; i < gfx_map->surfaceCount; i++)
 			{
 				const auto surface = &gfx_map->dpvs.surfaces[i];
 				const auto indices = &gfx_map->draw.indices[surface->tris.baseIndex];
-				bool too_far = false;
-
-				for (auto o = 0; o < surface->tris.triCount && !too_far; o++) 
+				auto too_far = false;
+				for (auto o = 0; o < surface->tris.triCount; o++)
 				{
 					game::vec3_t triangle[3]{};
-
-					for (auto j = 0; j < 3; j++) 
+					for (auto j = 0; j < 3; j++)
 					{
 						const auto index = indices[o * 3 + j] + surface->tris.firstVertex;
 						const auto vertex = &gfx_map->draw.vd.vertices[index];
-
-						if (distance_2d(vertex->xyz, origin) > 1000.f) 
+						if (distance_2d(vertex->xyz, origin) > 1000.f)
 						{
 							too_far = true;
 							break;
 						}
-
-						std::memcpy(&triangle[j], vertex->xyz, sizeof(float[3]));
+						triangle[j][0] = vertex->xyz[0];
+						triangle[j][1] = vertex->xyz[1];
+						triangle[j][2] = vertex->xyz[2];
 					}
 
-					if (!too_far && lineTriangleIntersection(triangle, origin, forward)) 
+					if (too_far)
+					{
+						break;
+					}
+
+					if (lineTriangleIntersection(triangle, origin, forward))
 					{
 						game::vec3_t center{};
 						getCenterPoint(triangle, center);
 						const auto dist = distance_3d(center, origin);
-
-						// a messy if statement of gross shifting between mats
-						if (dist < min_distance || min_distance == -1.f) 
+						if (dist < min_distance || min_distance == -1.f)
 						{
-							third_surface = secondary_surface;
-							third_min_distance = second_min_distance;
-							std::memcpy(&third_target_triangle, &secondary_target_triangle, sizeof(third_target_triangle));
-							std::memcpy(&third_target_center, &secondary_target_center, sizeof(game::vec3_t));
-
-							secondary_surface = target_surface;
-							second_min_distance = min_distance;
-							std::memcpy(&secondary_target_triangle, &target_triangle, sizeof(secondary_target_triangle));
-							std::memcpy(&secondary_target_center, &target_center, sizeof(game::vec3_t));
-
-							target_surface = surface;
 							min_distance = dist;
-							std::memcpy(&target_triangle, &triangle, sizeof(target_triangle));
+							target_surface = surface;
+							std::memcpy(&target_triangle, &triangle, sizeof(game::vec3_t[3]));
 							std::memcpy(&target_center, &center, sizeof(game::vec3_t));
-						}
-						else if (dist < second_min_distance || second_min_distance == -1.f) 
-						{
-							third_surface = secondary_surface;
-							third_min_distance = second_min_distance;
-							std::memcpy(&third_target_triangle, &secondary_target_triangle, sizeof(third_target_triangle));
-							std::memcpy(&third_target_center, &secondary_target_center, sizeof(game::vec3_t));
-
-							secondary_surface = surface;
-							second_min_distance = dist;
-							std::memcpy(&secondary_target_triangle, &triangle, sizeof(secondary_target_triangle));
-							std::memcpy(&secondary_target_center, &center, sizeof(game::vec3_t));
-						}
-						else if (dist < third_min_distance || third_min_distance == -1.f) 
-						{
-							third_surface = surface;
-							third_min_distance = dist;
-							std::memcpy(&third_target_triangle, &triangle, sizeof(third_target_triangle));
-							std::memcpy(&third_target_center, &center, sizeof(game::vec3_t));
 						}
 					}
 				}
@@ -281,28 +485,26 @@ namespace experimental
 				return;
 			}
 
-			// Surface materials info
-			const char* text = nullptr;
-
-			auto format_material_info = [&](const game::GfxSurface* surface) 
+			auto* material = target_surface->material;
+			if (!material || !material->name)
 			{
-				if (!surface || !surface->material || !surface->material->name)
-				{
-					return "";
-				}
+				return;
+			}
+			auto material_name = material->name;
 
-				auto techniqueset_name = surface->material->techniqueSet && surface->material->techniqueSet->name ?
-					utils::string::va("^3%s^7", surface->material->techniqueSet->name) : "^1null^7";
-				return utils::string::va("%s (%s) (baseIndex: %i, envIndex: %i)\n", surface->material->name, techniqueset_name, surface->tris.baseIndex, surface->laf.fields.primaryLightEnvIndex);
-			};
+			auto techniqueset_name = "^1null^7";
+			if (material->techniqueSet && material->techniqueSet->name)
+			{
+				techniqueset_name = utils::string::va("^3%s^7", material->techniqueSet->name);
+			}
 
-			text = utils::string::va("%s%s%s",
-				format_material_info(target_surface),
-				format_material_info(secondary_surface),
-				format_material_info(third_surface));
+			auto text = utils::string::va("%s (%s)",
+				material_name,
+				techniqueset_name);
+			current_material = text;
 
 			game::UI_DrawWrappedText(placement, text, &rect, font,
-				8.0, 240.0f, 0.2f, text_color, 6, 0, &text_rect, 0);
+				8.0, 240.0f, 0.2f, text_color, 0, 0, &text_rect, 0);
 		}
 
 		utils::hook::detour cg_draw2d_hook;
@@ -315,6 +517,7 @@ namespace experimental
 				render_draw_material();
 			}
 		}
+#endif
 	}
 
 	class component final : public component_interface
@@ -322,19 +525,58 @@ namespace experimental
 	public:
 		void post_unpack() override
 		{
-			if (!game::environment::is_mp())
-			{
-				return;
-			}
+			// use "wetmodel" for wet environments in costumemodeltable.csv
+			bg_customization_get_model_name_hook.create(0x62890_b, bg_customization_get_model_name_stub);
+
+			// fix static model's lighting going black sometimes
+			//dvars::override::register_int("r_smodelInstancedThreshold", 0, 0, 128, 0x0);
 
 			// change minimum cap to -2000 instead of -1000 (culling issue)
 			dvars::override::register_float("r_lodBiasRigid", 0, -2000, 0, game::DVAR_FLAG_SAVED);
+		
+			dvars::override::register_float("r_lodBiasSkinned", 0, -2000, 0, game::DVAR_FLAG_REPLICATED);
+			dvars::override::register_int("legacySpawningEnabled", 0, 0, 0, game::DVAR_FLAG_READ);
 
+			// stop game from outputting once per frame warnings
+			//utils::hook::call(0x6BBB81_b, empty_func);
+			utils::hook::copy(0x6BBB81_b, "\xC2\x00\x00", 3); // equivalent
+
+			utils::hook::nop(0x26D99F_b, 5); // stop unk call (probably for server host?)
+			utils::hook::copy_string(0x8E31D8_b, "h2_loading_animation"); // swap loading icon
+			utils::hook::set<uint8_t>(0xC393F_b, 11); // increment persistent player data clcState check
+
+			utils::hook::set<float>(0x8FBA04_b, 350.f); // modify position of loading information
+			utils::hook::set<uint8_t>(0x53C9FA_b, 0xEB); // Patoke @todo: what is this?
+
+			dvars::override::register_bool("dynent_active", false, game::DVAR_FLAG_READ);
+			dvars::override::register_float("dynEnt_playerWakeUpRadius", 0, 0, 0, game::DVAR_FLAG_REPLICATED);
+		
+			utils::hook::set<uint8_t>(0xF8339_b, 4); // change max overhead rank text size 
+			
+			// Hacky way of opening lui menu_mapvote
+			sv_open_menu_mapvote = dvars::register_bool("sv_open_menu_mapvote", false, game::DVAR_FLAG_EXTERNAL, "Open mapvote lui");
+			scheduler::loop(open_lui_mapvote, scheduler::pipeline::lui, 100ms);
+
+			/*
+				voice experiments
+			*/
+			hmw_voice_chat::setup_hooks();
+
+			// add predator missile boosting
+			missile_trajectory_controlled_hook.create(0x42AAE0_b, missile_trajectory_controlled_stub);
+
+			/* Ninja Perk */
+			//CG_GetFootstepVolumeScale_Detour.create(0x3E5440_b, CG_GetFootstepVolumeScale_Stub);
+			dvars::register_float("perk_footstepVolumeQuietPlayer", 0.25f, 0.0f, 3.4f, game::DVAR_FLAG_CHEAT, "Volume of player footstep sounds with 'quiet move' perk");
+			dvars::register_float("perk_footstepVolumeQuietNPC", 0.25f, 0.0f, 3.4f, game::DVAR_FLAG_CHEAT, "Volume of NPC footstep sounds with 'quiet move' perk");
+
+			//utils::hook::jump(0x2DBA53_b, utils::hook::assemble(commando_lunge_stub), true);
+#ifdef DEBUG
 			cg_draw_material = dvars::register_bool("cg_drawMaterial", false, game::DVAR_FLAG_NONE, "Draws material name on screen");
 			cg_draw2d_hook.create(0xF57D0_b, cg_draw2d_stub);
+#endif
 		}
 	};
 }
 
 REGISTER_COMPONENT(experimental::component)
-#endif

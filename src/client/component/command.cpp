@@ -8,7 +8,6 @@
 #include "filesystem.hpp"
 #include "game_console.hpp"
 #include "logfile.hpp"
-#include "mods.hpp"
 #include "scheduler.hpp"
 
 #include "game/game.hpp"
@@ -42,7 +41,7 @@ namespace command
 
 		void client_command(const char client_num)
 		{
-			if (game::mp::g_entities[client_num].client == nullptr)
+			if (game::g_entities[client_num].client == nullptr)
 			{
 				// Client is not fully connected
 				return;
@@ -199,17 +198,11 @@ namespace command
 			return 0;
 		}
 
+#ifdef DEBUG
 		void client_println(int client_num, const std::string& text)
 		{
-			if (game::environment::is_sp())
-			{
-				game::CG_GameMessage(0, text.data());
-			}
-			else
-			{
-				game::SV_GameSendServerCommand(client_num, game::SV_CMD_RELIABLE,
+			game::SV_GameSendServerCommand(client_num, game::SV_CMD_RELIABLE,
 					utils::string::va("f \"%s\"", text.data()));
-			}
 		}
 
 		bool check_cheats(int client_num)
@@ -260,10 +253,7 @@ namespace command
 					}
 					else
 					{
-						const auto amount = SELECT_VALUE(
-							game::Dvar_FindVar("g_player_maxhealth")->current.integer,
-							atoi(game::Dvar_FindVar("scr_player_maxhealth")->current.string)
-						);
+						const auto amount = atoi(game::Dvar_FindVar("scr_player_maxhealth")->current.string);
 						player.set("health", {amount});
 					}
 				}
@@ -347,7 +337,7 @@ namespace command
 				try
 				{
 					const auto player = scripting::entity({static_cast<uint16_t>(client_num), 0});
-					player.call(SELECT_VALUE("kill", "suicide"));
+					player.call("suicide");
 				}
 				catch (...)
 				{
@@ -357,43 +347,75 @@ namespace command
 
 		void toggle_entity_flag(int client_num, int value, const std::string& name)
 		{
-			game::mp::g_entities[client_num].flags ^= value;
+			game::g_entities[client_num].flags ^= value;
 			client_println(client_num, utils::string::va("%s %s",
 				name.data(),
-				game::mp::g_entities[client_num].flags & value
-					? "^2on"
-					: "^1off"));
-		}
-
-		void toggle_entity_flag(int value, const std::string& name)
-		{
-			game::sp::g_entities[0].flags ^= value;
-			client_println(0, utils::string::va("%s %s",
-				name.data(),
-				game::sp::g_entities[0].flags & value
+				game::g_entities[client_num].flags & value
 					? "^2on"
 					: "^1off"));
 		}
 
 		void toggle_client_flag(int client_num, int value, const std::string& name)
 		{
-			game::mp::g_entities[client_num].client->flags ^= value;
+			game::g_entities[client_num].client->flags ^= value;
 			client_println(client_num, utils::string::va("%s %s",
 				name.data(),
-				game::mp::g_entities[client_num].client->flags & value
+				game::g_entities[client_num].client->flags & value
 					? "^2on"
 					: "^1off"));
+		}
+#endif
+	}
+
+	bool cmd_validation(const std::string& dvar, const std::string& value)
+	{
+		if (dvar == "net_port")
+		{
+			bool is_numeric = true;
+			int port = 0;
+
+			try
+			{
+				port = std::stoi(value);
+			}
+			catch (const std::invalid_argument&)
+			{
+				is_numeric = false;
+			}
+			catch (const std::out_of_range&)
+			{
+				is_numeric = false;
+			}
+
+			if (is_numeric && port >= std::numeric_limits<uint16_t>::min() && port <= std::numeric_limits<uint16_t>::max())
+			{
+				console::info("Successfully set custom port: %i", port);
+				return true;
+			}
+			else
+			{
+				console::error("Invalid port value. Must be a number between %u and %u.", std::numeric_limits<uint16_t>::min(), std::numeric_limits<uint16_t>::max());
+				return false;
+			}
+		}
+		else if (dvar == "net_ip")
+		{
+			std::string ip_str = value;
+			sockaddr_in sa;
+
+			if (inet_pton(AF_INET, ip_str.c_str(), &(sa.sin_addr)) == 1)
+			{
+				console::info("Successfully set custom IPv4 address for net_ip dvar: %s", ip_str.c_str());
+				return true;
+			}
+			else
+			{
+				console::error("Invalid IPv4 address format for net_ip dvar.");
+				return false;
+			}
 		}
 
-		void toggle_client_flag(int value, const std::string& name)
-		{
-			game::sp::g_entities[0].client->flags ^= value;
-			client_println(0, utils::string::va("%s %s",
-				name.data(),
-				game::sp::g_entities[0].client->flags & value
-					? "^2on"
-					: "^1off"));
-		}
+		return false;
 	}
 
 	void read_startup_variable(const std::string& dvar)
@@ -407,11 +429,13 @@ namespace command
 		for (int i = 0; i < com_num_console_lines; i++)
 		{
 			game::Cmd_TokenizeString(com_console_lines[i]);
-
-			// only +set dvar value
 			if (game::Cmd_Argc() >= 3 && game::Cmd_Argv(0) == "set"s && game::Cmd_Argv(1) == dvar)
 			{
-				game::Dvar_SetCommand(game::generateHashValue(game::Cmd_Argv(1)), "", game::Cmd_Argv(2));
+				std::string value = game::Cmd_Argv(2);
+				if (cmd_validation(dvar, value))
+				{
+					game::Dvar_SetCommand(game::generateHashValue(game::Cmd_Argv(1)), "", game::Cmd_Argv(2));
+				}
 			}
 
 			game::Cmd_EndTokenizeString();
@@ -531,6 +555,7 @@ namespace command
 		});
 	}
 
+#ifdef DEBUG
 	void add_sv(const char* name, std::function<void(int, const params_sv&)> callback)
 	{
 		// doing this so the sv command would show up in the console
@@ -541,6 +566,7 @@ namespace command
 		if (handlers_sv.find(command) == handlers_sv.end())
 			handlers_sv[command] = std::move(callback);
 	}
+#endif
 
 	void execute(std::string command, const bool sync)
 	{
@@ -561,17 +587,15 @@ namespace command
 	public:
 		void post_unpack() override
 		{
-			if (game::environment::is_sp())
+			if (!game::environment::is_dedi())
 			{
-				add_commands_sp();
-			}
-			else
-			{
-				utils::hook::call(0x15C44B_b, parse_commandline_stub);
-				add_commands_mp();
+				utils::hook::set<uint8_t>(0x139B8A_b, 0xEB);
 			}
 
-			utils::hook::jump(SELECT_VALUE(0x3A7C80_b, 0x4E9F40_b), dvar_command_stub, true);
+			utils::hook::call(0x15C44B_b, parse_commandline_stub);
+			add_commands_mp();
+
+			utils::hook::jump(0x4E9F40_b, dvar_command_stub, true);
 
 			add_commands_generic();
 		}
@@ -580,6 +604,8 @@ namespace command
 		static void add_commands_generic()
 		{
 			add("quit", game::Quit);
+
+#ifdef DEBUG
 			add("crash", []
 			{
 				*reinterpret_cast<int*>(1) = 0x12345678;
@@ -592,7 +618,7 @@ namespace command
 				std::string filename;
 				if (argument.size() == 2)
 				{
-					filename = "h1-mod/";
+					filename = "hmw-mod/";
 					filename.append(argument[1]);
 					if (!filename.ends_with(".txt"))
 					{
@@ -658,6 +684,7 @@ namespace command
 					}, true);
 				}
 			});
+#endif
 
 			add("vstr", [](const params& params)
 			{
@@ -671,14 +698,14 @@ namespace command
 				const auto dvar = game::Dvar_FindVar(name);
 				if (dvar == nullptr)
 				{
-					console::info("%s doesn't exist\n", name);
+					console::error("%s doesn't exist\n", name);
 					return;
 				}
 
 				if (dvar->type != game::dvar_type::string
 					&& dvar->type != game::dvar_type::enumeration)
 				{
-					console::info("%s is not a string-based dvar\n", name);
+					console::error("%s is not a string-based dvar\n", name);
 					return;
 				}
 
@@ -686,103 +713,11 @@ namespace command
 			});
 		}
 
-		static void add_commands_sp()
-		{
-			add("god", []()
-			{
-				if (!game::SV_Loaded())
-				{
-					return;
-				}
-
-				toggle_entity_flag(1, "godmode");
-			});
-
-			add("demigod", []()
-			{
-				if (!game::SV_Loaded())
-				{
-					return;
-				}
-
-				toggle_entity_flag(2, "demigod mode");
-			});
-
-			add("notarget", []()
-			{
-				if (!game::SV_Loaded())
-				{
-					return;
-				}
-
-				toggle_entity_flag(4, "notarget");
-			});
-
-			add("noclip", []()
-			{
-				if (!game::SV_Loaded())
-				{
-					return;
-				}
-
-				toggle_client_flag(1, "noclip");
-			});
-
-			add("ufo", []()
-			{
-				if (!game::SV_Loaded())
-				{
-					return;
-				}
-
-				toggle_client_flag(2, "ufo");
-			});
-
-			add("dropweapon", [](const params& params)
-			{
-				if (!game::SV_Loaded())
-				{
-					return;
-				}
-
-				cmd_drop_weapon(0);
-			});
-
-			add("take", [](const params& params)
-			{
-				if (!game::SV_Loaded())
-				{
-					return;
-				}
-
-				cmd_take_weapon(0, params.get_all());
-			});
-
-			add("kill", [](const params& params)
-			{
-				if (!game::SV_Loaded())
-				{
-					return;
-				}
-
-				cmd_kill(0);
-			});
-			
-			add("give", [](const params& params)
-			{
-				if (!game::SV_Loaded())
-				{
-					return;
-				}
-
-				cmd_give_weapon(0, params.get_all());
-			});
-		}
-
 		static void add_commands_mp()
 		{
 			client_command_hook.create(0x4132E0_b, &client_command);
 
+#ifdef DEBUG
 			add_sv("god", [](const int client_num, const params_sv&)
 			{
 				if (!check_cheats(client_num))
@@ -873,59 +808,72 @@ namespace command
 				cmd_kill(client_num);
 			});
 
-			add_sv("getviewpos", [](const int client_num, const params_sv& params)
-			{
-				console::info("%f, %f, %f\n", 
-					game::mp::g_entities[client_num].client->ps.origin[0], 
-					game::mp::g_entities[client_num].client->ps.origin[1], 
-					game::mp::g_entities[client_num].client->ps.origin[2]);
-			});
-
-			add_sv("setviewpos", [](const int client_num, const params_sv& params)
+			add_sv("setviewmodel", [](const int client_num, const params_sv& params)
 			{
 				if (!check_cheats(client_num))
 				{
 					return;
 				}
 
-				if (params.size() < 4)
+				const auto player = scripting::entity({ static_cast<uint16_t>(client_num), 0 });
+
+				if (params.size() < 2)
 				{
-					game::SV_GameSendServerCommand(client_num, game::SV_CMD_RELIABLE,
-						"f \"You did not specify the correct number of coordinates\"");
+					console::info("usage: setviewmodel <model>");
 					return;
 				}
 
-				game::mp::g_entities[client_num].client->ps.origin[0] = std::strtof(params.get(1), nullptr);
-				game::mp::g_entities[client_num].client->ps.origin[1] = std::strtof(params.get(2), nullptr);
-				game::mp::g_entities[client_num].client->ps.origin[2] = std::strtof(params.get(3), nullptr);
+				auto model = params.get(1);
+
+				if (model == nullptr)
+				{
+					console::info("usage: setviewmodel <model>");
+					return;
+				}
+
+				auto modelXAsset = game::DB_FindXAssetHeader(game::ASSET_TYPE_XMODEL, model, 0).model;
+
+
+				if (modelXAsset == nullptr)
+				{
+					client_println(client_num, utils::string::va("model '%s' does not exist.", model));
+					return;
+				}
+
+				player.call("setviewmodel", { model });
+				client_println(client_num, utils::string::va("model '%s' set as viewmodel.", model));
 			});
 
-			add_sv("getviewang", [](const int client_num, const params_sv& params)
+			add_sv("weap_check", [](const int client_num, const params_sv& params)
 			{
-				console::info("%f, %f, %f\n",
-					game::mp::g_entities[client_num].client->ps.delta_angles[0],
-					game::mp::g_entities[client_num].client->ps.delta_angles[1],
-					game::mp::g_entities[client_num].client->ps.delta_angles[2]);
-			});
-
-			add_sv("setviewang", [](const int client_num, const params_sv& params)
-			{
-				if (!check_cheats(client_num))
+				if (params.size() < 2)
 				{
+					console::info("usage: weap_check <weapon>");
 					return;
 				}
 
-				if (params.size() < 4)
+				auto weapon = params.get(1);
+
+				if (weapon == nullptr)
 				{
-					game::SV_GameSendServerCommand(client_num, game::SV_CMD_RELIABLE,
-						"f \"You did not specify the correct number of coordinates\"");
+					console::info("usage: weap_check <weapon>");
 					return;
 				}
 
-				game::mp::g_entities[client_num].client->ps.delta_angles[0] = std::strtof(params.get(1), nullptr);
-				game::mp::g_entities[client_num].client->ps.delta_angles[1] = std::strtof(params.get(2), nullptr);
-				game::mp::g_entities[client_num].client->ps.delta_angles[2] = std::strtof(params.get(3), nullptr);
+				game::WeaponDef_liam* weaponAsset = reinterpret_cast<game::WeaponDef_liam*>(game::DB_FindXAssetHeader(game::XAssetType::ASSET_TYPE_WEAPON, weapon, false).weapon);
+
+				if (weaponAsset == nullptr)
+				{
+					console::info("weapon %s does not exist!", weapon);
+					return;
+				}
+
+				for (auto i = 0; i < weaponAsset->numOfAttachments; i++)
+				{
+					console::info("Weapon Has Valid Attachment: %s", weaponAsset->attachments[i]->name);
+				}
 			});
+#endif
 		}
 	};
 }

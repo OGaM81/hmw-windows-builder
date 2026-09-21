@@ -60,13 +60,18 @@
 #undef min
 #endif
 
-#ifdef _DEBUG
+#ifdef DEBUG
 //#define DW_DEBUG
+#include <imgui.h>
+#include <imgui_internal.h>
+#include <backends/imgui_impl_dx11.h>
+#include <backends/imgui_impl_win32.h>
+#include <misc/cpp/imgui_stdlib.h>
 #endif
 
-#define MSG_BOX_INFO(message) MessageBoxA(nullptr, message, "H1-Mod: INFORMATION", MB_ICONINFORMATION);
-#define MSG_BOX_WARN(message) MessageBoxA(nullptr, message, "H1-Mod: WARNING", MB_ICONWARNING);
-#define MSG_BOX_ERROR(message) MessageBoxA(nullptr, message, "H1-Mod: ERROR", MB_ICONERROR);
+#define MSG_BOX_INFO(message) MessageBoxA(nullptr, message, "hmw-mod: INFORMATION", MB_ICONINFORMATION);
+#define MSG_BOX_WARN(message) MessageBoxA(nullptr, message, "hmw-mod: WARNING", MB_ICONWARNING);
+#define MSG_BOX_ERROR(message) MessageBoxA(nullptr, message, "hmw-mod: ERROR", MB_ICONERROR);
 
 #include <map>
 #include <atomic>
@@ -111,11 +116,6 @@
 #include <proto/auth.pb.h>
 
 #include <d3d11.h>
-#include <imgui.h>
-#include <imgui_internal.h>
-#include <backends/imgui_impl_dx11.h>
-#include <backends/imgui_impl_win32.h>
-#include <misc/cpp/imgui_stdlib.h>
 
 #pragma warning(pop)
 #pragma warning(disable: 4100)

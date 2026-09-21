@@ -3,16 +3,25 @@
 
 #include "game/game.hpp"
 
+#include "component/console.hpp"
 #include "component/game_module.hpp"
 #include "component/scheduler.hpp"
 
-#include <utils/concurrency.hpp>
 #include <utils/hook.hpp>
-#include <utils/nt.hpp>
 #include <utils/string.hpp>
 
 #include "integrity.hpp"
 #include "breakpoints.hpp"
+#include "window_variations.hpp"
+
+
+#include "utils/obfus.hpp"
+
+// use this if you want to debug out of VS or for whatever use case you need
+// this seems to cause instability on client and may crash randomly starting up
+#ifdef DEBUG
+#define PATCH_BREAKPOINTS
+#endif
 
 #define PRECOMPUTED_INTEGRITY_CHECKS
 #define PRECOMPUTED_BREAKPOINTS
@@ -111,12 +120,20 @@ namespace arxan
 
 			if (!context)
 			{
-				OutputDebugStringA(utils::string::va("Unable to find frame offset for: %llX", return_address));
+				OutputDebugStringA(utils::string::va(OBF("Unable to find frame offset for: %llX"), return_address));
 				return current_checksum;
 			}
 
 			const auto correct_checksum = *context->original_checksum;
 			*context->computed_checksum = correct_checksum;
+
+			if (current_checksum != correct_checksum)
+			{
+#ifdef DEBUG
+				OutputDebugStringA(utils::string::va(OBF("Adjusting checksum (%llX): %X -> %X"), handler_address,
+					current_checksum, correct_checksum));
+#endif
+			}
 
 			return correct_checksum;
 		}
@@ -131,7 +148,7 @@ namespace arxan
 
 			if ((next_inst & 0xFF00FFFF) != 0xFF004583)
 			{
-				throw std::runtime_error(utils::string::va("Unable to patch intact basic block: %llX", game_address));
+				throw std::runtime_error(utils::string::va(OBF("Unable to patch intact basic block: %llX"), game_address));
 			}
 
 			const auto other_frame_offset = static_cast<uint8_t>(next_inst >> 16);
@@ -221,27 +238,13 @@ namespace arxan
 #ifdef PRECOMPUTED_INTEGRITY_CHECKS
 		void search_and_patch_integrity_checks_precomputed()
 		{
-			if (game::environment::is_sp())
+			for (const auto i : intact_integrity_check_blocks)
 			{
-				for (const auto i : sp::intact_integrity_check_blocks)
-				{
-					patch_intact_basic_block_integrity_check(reinterpret_cast<void*>(i));
-				}
-				for (const auto i : sp::split_integrity_check_blocks)
-				{
-					patch_split_basic_block_integrity_check(reinterpret_cast<void*>(i));
-				}
+				patch_intact_basic_block_integrity_check(reinterpret_cast<void*>(i));
 			}
-			else
+			for (const auto i : split_integrity_check_blocks)
 			{
-				for (const auto i : mp::intact_integrity_check_blocks)
-				{
-					patch_intact_basic_block_integrity_check(reinterpret_cast<void*>(i));
-				}
-				for (const auto i : mp::split_integrity_check_blocks)
-				{
-					patch_split_basic_block_integrity_check(reinterpret_cast<void*>(i));
-				}
+				patch_split_basic_block_integrity_check(reinterpret_cast<void*>(i));
 			}
 		}
 #endif
@@ -303,7 +306,7 @@ namespace arxan
 
 		NTSTATUS NTAPI nt_close_stub(const HANDLE handle)
 		{
-			char info[16];
+			char info[16]{};
 			if (NtQueryObject(handle, OBJECT_INFORMATION_CLASS(4), &info, 2, nullptr) >= 0 && size_t(handle) != 0x12345)
 			{
 				auto* orig = static_cast<decltype(NtClose)*>(nt_close_hook.get_original());
@@ -403,7 +406,7 @@ namespace arxan
 
 		void store_debug_functions()
 		{
-			const utils::nt::library ntdll("ntdll.dll");
+			const utils::nt::library ntdll(OBF("ntdll.dll"));
 
 			for (auto i = 0; i < DBG_FUNCS_COUNT; i++)
 			{
@@ -420,9 +423,10 @@ namespace arxan
 			}
 		}
 
+#ifdef PATCH_BREAKPOINTS
 		namespace breakpoints
 		{
-			utils::concurrency::container<std::unordered_map<PVOID, void*>> handle_handler;
+			std::unordered_map<PVOID, void*> handle_handler;
 
 			void fake_breakpoint_trigger(void* address, _CONTEXT* fake_context)
 			{
@@ -434,14 +438,14 @@ namespace arxan
 				fake_record.ExceptionAddress = reinterpret_cast<void*>(reinterpret_cast<std::uint64_t>(address) + 3);
 				fake_record.ExceptionCode = EXCEPTION_BREAKPOINT;
 
-				for (auto handler : handle_handler.get_raw())
+				for (auto& handler : handle_handler)
 				{
 					if (handler.second)
 					{
 						auto result = utils::hook::invoke<LONG>(handler.second, &fake_info);
 						if (result)
 						{
-							//memset(fake_context, 0, sizeof(_CONTEXT));
+							memset(fake_context, 0, sizeof(_CONTEXT));
 							break;
 						}
 					}
@@ -478,7 +482,7 @@ namespace arxan
 #ifdef PRECOMPUTED_BREAKPOINTS
 			void patch_breakpoints_precomputed()
 			{
-				for (const auto i : mp::int2d_breakpoint_addresses)
+				for (const auto i : int2d_breakpoint_addresses)
 				{
 					patch_int2d_trap(reinterpret_cast<void*>(i));
 				}
@@ -493,12 +497,6 @@ namespace arxan
 					return;
 				}
 				once = true;
-
-				// sp has no breakpoints
-				if (game::environment::is_sp())
-				{
-					return;
-				}
 
 #ifdef PRECOMPUTED_BREAKPOINTS
 				assert(game::base_address == 0x140000000);
@@ -517,20 +515,102 @@ namespace arxan
 				breakpoints::patch_breakpoints();
 
 				auto handle = AddVectoredExceptionHandler(first, handler);
-				handle_handler.access([&](std::unordered_map<PVOID, void*>& p)
-				{
-					p[handle] = handler;
-				});
+				handle_handler[handle] = handler;
+
 				return handle;
 			}
 
 			ULONG WINAPI remove_vectored_exception_handler_stub(PVOID handle)
 			{
-				handle_handler.access([&](std::unordered_map<PVOID, void*>& p)
-				{
-					p[handle] = nullptr;
-				});
+				handle_handler[handle] = nullptr;
 				return RemoveVectoredExceptionHandler(handle);
+			}
+		}
+#endif
+
+
+
+		static BOOL enumWindowCallback(HWND hWnd, LPARAM lparam) {
+			int length = GetWindowTextLength(hWnd);
+			char* buffer = new char[length + 1];
+			GetWindowText(hWnd, buffer, length + 1);
+			std::string windowTitle(buffer);
+			delete[] buffer;
+
+			// List visible windows with a non-empty title
+			if (IsWindowVisible(hWnd) && length != 0) {
+				int variationsSize = sizeof(window_variations) / sizeof(window_variations[0]);
+
+				// Loop over the variations array
+				for (int i = 0; i < variationsSize; ++i) {
+					auto clean_variation = utils::string::to_lower(window_variations[i]);
+
+					// Search for complete matches
+					std::string lowerWindowTitle = utils::string::to_lower(windowTitle);
+					size_t pos = lowerWindowTitle.find(clean_variation);
+
+					// Check whether the variation is available as a complete word
+					while (pos != std::string::npos) {
+						bool isStart = (pos == 0 || lowerWindowTitle[pos - 1] == ' '); 
+						bool isEnd = (pos + clean_variation.length() == lowerWindowTitle.length() || lowerWindowTitle[pos + clean_variation.length()] == ' ');
+
+						if (isStart && isEnd) {
+							exit(0); 
+							break;
+						}
+
+						pos = lowerWindowTitle.find(clean_variation, pos + 1);
+					}
+				}
+			}
+			return TRUE;
+		}
+
+		static const char* dodgy_modules[] = {
+			"unlockall.dll",
+			"Unlockall.dll",
+			"UNLOCKALL.DLL",
+			"UnlockAll.dll",
+			"unlockAll.dll",
+			"uNLOCKaLL.dll",
+			"UNLOCKaLL.DLL",
+			"unlock4ll.dll",
+			"unlock@ll.dll",
+			"unlock411.dll",
+			"un10ck4ll.dll",
+			"un10ck@ll.dll",
+			"unlock_all.dll",
+			"unlock-all.dll",
+			"unlockall .dll",
+			"unlockall(1).dll",
+			"unlockall_123.dll",
+			"unl0ck4ll.dll",
+			"unlockall!dll",
+			"unlockall_dll",
+			"unl0ck4ll",
+			"ByteMeEngine"
+		};
+
+		void CheckLoadedModules()
+		{
+			HMODULE hMods[1024];
+			HANDLE hProcess = GetCurrentProcess();
+			DWORD cbNeeded;
+
+			if (EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded)) {
+				for (int i = 0; i < (cbNeeded / sizeof(HMODULE)); i++) {
+					TCHAR szModName[MAX_PATH];
+					if (GetModuleFileNameEx(hProcess, hMods[i], szModName, sizeof(szModName) / sizeof(TCHAR))) {
+						for (auto i = 0; i < ARRAYSIZE(dodgy_modules); i++)
+						{
+							if (strstr(utils::string::to_lower(szModName).c_str(), dodgy_modules[i]))
+							{
+								exit(0);
+								break;
+							}
+						}
+					}
+				}
 			}
 		}
 	}
@@ -541,16 +621,15 @@ namespace arxan
 	public:
 		void* load_import(const std::string& library, const std::string& function) override
 		{
-			if (game::environment::is_sp()) return nullptr;
-
-			static auto is_wine = utils::nt::is_wine();
-			if (!is_wine)
+			if (function == "SetThreadContext")
 			{
-				if (function == "SetThreadContext")
-				{
-					return set_thread_context_stub;
-				}
-				else if (function == "AddVectoredExceptionHandler")
+				return set_thread_context_stub;
+			}
+
+#ifdef PATCH_BREAKPOINTS
+			if (!utils::nt::is_wine())
+			{
+				if (function == "AddVectoredExceptionHandler")
 				{
 					return breakpoints::add_vectored_exception_handler_stub;
 				}
@@ -559,28 +638,42 @@ namespace arxan
 					return breakpoints::remove_vectored_exception_handler_stub;
 				}
 			}
+#endif
 
 			return nullptr;
 		}
 
+		void post_start() override
+		{
+#ifndef DEBUG
+			EnumWindows(enumWindowCallback, NULL);
+			CheckLoadedModules();
+			scheduler::loop([]
+				{
+					EnumWindows(enumWindowCallback, NULL);
+					CheckLoadedModules();
+				});
+#endif // !DEBUG
+		}
+
 		void post_load() override
 		{
-			if (game::environment::is_sp()) return;
+#ifdef DEBUG
+#ifndef PATCH_BREAKPOINTS
+			printf("PATCH_BREAKPOINTS is disabled\n");
+#endif
+#endif
 
-			if (!utils::nt::is_wine())
-			{
-				remove_hardware_breakpoints();
-				hide_being_debugged();
-				scheduler::loop(hide_being_debugged, scheduler::pipeline::async);
-				store_debug_functions();
-			}
+			remove_hardware_breakpoints();
+			hide_being_debugged();
+			scheduler::loop(hide_being_debugged, scheduler::pipeline::async);
+			store_debug_functions();
 
-			const utils::nt::library ntdll("ntdll.dll");
+			const utils::nt::library ntdll(OBF("ntdll.dll"));
 			nt_close_hook.create(ntdll.get_proc<void*>("NtClose"), nt_close_stub);
 
 			const auto nt_query_information_process = ntdll.get_proc<void*>("NtQueryInformationProcess");
 			nt_query_information_process_hook.create(nt_query_information_process, nt_query_information_process_stub);
-			nt_query_information_process_hook.enable();
 			nt_query_information_process_hook.move();
 
 			AddVectoredExceptionHandler(1, exception_filter);
@@ -588,14 +681,9 @@ namespace arxan
 
 		void post_unpack() override
 		{
-			if (game::environment::is_sp()) return;
-
-			if (!utils::nt::is_wine())
-			{
-				remove_hardware_breakpoints();
-				search_and_patch_integrity_checks();
-				restore_debug_functions();
-			}
+			remove_hardware_breakpoints();
+			search_and_patch_integrity_checks();
+			restore_debug_functions();
 		}
 	};
 }

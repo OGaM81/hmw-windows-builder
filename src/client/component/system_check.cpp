@@ -32,7 +32,7 @@ namespace system_check
 		std::string hash_zone(const std::string& name)
 		{
 			const auto data = read_zone(name);
-			return utils::cryptography::md5::compute(data, true);
+			return utils::cryptography::sha256::compute(data, true);
 		}
 
 		bool verify_hashes(const std::unordered_map<std::string, std::string>& zone_hashes)
@@ -53,13 +53,15 @@ namespace system_check
 		{
 			static std::unordered_map<std::string, std::string> mp_zone_hashes =
 			{
-				{"patch_ui_mp.ff", "A308EE76F49E7FF6B30B33CB37D77282"},
+				{"patch_common_mp.ff", "E45EF5F29D12A5A47F405F89FBBEE479C0A90D02141ABF852D481689514134A1"},
 			};
 
 			static std::unordered_map<std::string, std::string> sp_zone_hashes =
 			{
-				{"patch_icbm.ff", "05581F47DC7965C0272D50538A30660A"},
+				// Steam doesn't necessarily deliver this file :(
+				{"patch_common.ff", "1D32A9770F90ED022AA76F4859B4AB178E194A703383E61AC2CE83B1E828B18F"},
 			};
+
 
 			return verify_hashes(mp_zone_hashes) && (game::environment::is_dedi() || verify_hashes(sp_zone_hashes));
 		}
