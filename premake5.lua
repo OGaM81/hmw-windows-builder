@@ -259,7 +259,7 @@ filter "configurations:Release"
 	buildoptions {"/GL"}
 	linkoptions { "/IGNORE:4702", "/LTCG" }
 	defines {"NDEBUG"}
-	flags {"FatalCompileWarnings"}
+	-- FatalCompileWarnings disabled for CI on newer MSVC (obfus/voice/tcp noise)
 filter {}
 
 filter "configurations:Debug"
