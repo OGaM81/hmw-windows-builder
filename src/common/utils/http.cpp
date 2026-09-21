@@ -1,5 +1,6 @@
 #include "http.hpp"
 #include <algorithm>
+#include <chrono>
 #include <curl/curl.h>
 #include <gsl/gsl>
 
@@ -23,7 +24,7 @@ namespace utils::http
 			try
 			{
 				const auto now = std::chrono::high_resolution_clock::now();
-				const auto count = max(1, static_cast<int>(std::chrono::duration_cast<
+				const auto count = (std::max)(1, static_cast<int>(std::chrono::duration_cast<
 					std::chrono::seconds>(now - helper->start).count()));
 				const auto speed = dlnow / count;
 
